@@ -14,6 +14,7 @@ Export to Parquet: use scripts/export_parquet.py
 import json
 import logging
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -23,6 +24,7 @@ from tqdm import tqdm
 
 from simtradedata.config.field_mappings import BENCHMARK_CONFIG
 from simtradedata.fetchers.baostock_fetcher import BaoStockFetcher, read_baostock_result
+from simtradedata.fetchers.public_source_fetcher import statement_on_date
 from simtradedata.fetchers.unified_fetcher import UnifiedDataFetcher
 from simtradedata.processors.data_splitter import DataSplitter
 from simtradedata.utils.process_lock import ProcessLock
@@ -33,12 +35,41 @@ OUTPUT_DIR = "data"
 LOG_FILE = "data/download_efficient.log"
 LOCK_FILE = "data/.download.lock"
 
-# Date range configuration
-START_DATE = "2015-01-01"
+# Date range configuration. Full-history rebuilds override the legacy 2015
+# package floor through SIMTRADE_CN_HISTORY_START.
+START_DATE = os.environ.get("SIMTRADE_CN_HISTORY_START") or "2015-01-01"
 END_DATE = None  # None means use current date
 
 # Batch configuration
 BATCH_SIZE = 20
+
+
+def _parallel_fetch(fetch, symbols, workers):
+    """Run network-only fetches concurrently; return DataFrame or Exception per symbol.
+
+    DuckDBWriter and the public-statement cache are not thread-safe, so this
+    helper never touches the database. Exceptions are returned per symbol to
+    keep the caller's per-symbol accounting identical to the serial path.
+    """
+    results = {}
+    if not symbols:
+        return results
+    if workers <= 1 or len(symbols) == 1:
+        for symbol in symbols:
+            try:
+                results[symbol] = fetch(symbol)
+            except Exception as exc:  # noqa: BLE001
+                results[symbol] = exc
+        return results
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(fetch, symbol): symbol for symbol in symbols}
+        for future in as_completed(futures):
+            symbol = futures[future]
+            try:
+                results[symbol] = future.result()
+            except Exception as exc:  # noqa: BLE001
+                results[symbol] = exc
+    return results
 
 # Ensure log directory exists
 Path(LOG_FILE).parent.mkdir(parents=True, exist_ok=True)
@@ -50,6 +81,11 @@ logging.basicConfig(
     filemode="w",
 )
 logger = logging.getLogger(__name__)
+
+
+# Use the shared, non-blocking ProcessLock from simtradedata.utils (imported
+# above). The old local redefinition shadowed it with FileLock(timeout=-1)
+# and unlinked the lock file on release, allowing concurrent entry.
 
 
 class EfficientBaoStockDownloader:
@@ -76,6 +112,29 @@ class EfficientBaoStockDownloader:
 
         self.status_cache = {}
         self.failed_stocks = []
+        self._public_statements = {}
+        # Only pure network fetches are parallelised; DB writes stay serial.
+        # Set SIMTRADE_DOWNLOAD_WORKERS=1 for the original serial behaviour.
+        self.download_workers = max(1, int(os.environ.get("SIMTRADE_DOWNLOAD_WORKERS", "4")))
+
+    def _public_statement(self, symbol: str) -> pd.DataFrame:
+        """一只股票只拉一次新浪报表，并补到已经入库的报告期上。"""
+        cached = self._public_statements.get(symbol)
+        if cached is not None:
+            return cached
+        try:
+            from simtradedata.fetchers.public_source_fetcher import (
+                PublicSourceFetcher,
+            )
+
+            frame = PublicSourceFetcher().fetch_fundamentals(symbol)
+        except Exception as exc:
+            logger.warning("新浪报表 %s: %s", symbol, exc)
+            frame = pd.DataFrame()
+        self._public_statements[symbol] = frame
+        if not frame.empty:
+            self.writer.fill_statement_fields(symbol, frame)
+        return frame
 
     def get_incremental_start_date(self, symbol: str) -> str:
         """
@@ -409,18 +468,36 @@ class EfficientBaoStockDownloader:
                 for batch in batches:
                     self.writer.begin()
                     try:
+                        # DB reads/writes and the public-statement cache stay on
+                        # this thread; only the pure network fetch is parallel.
+                        pending = [
+                            symbol for symbol in batch
+                            if not self.writer.has_fundamental(symbol, q_end)
+                        ]
+                        skip_count += len(batch) - len(pending)
+                        fetched = _parallel_fetch(
+                            lambda symbol: self.standard_fetcher.fetch_quarterly_fundamentals(
+                                symbol, year, quarter
+                            ),
+                            pending,
+                            self.download_workers,
+                        )
                         for symbol in batch:
                             try:
-                                if self.writer.has_fundamental(symbol, q_end):
-                                    skip_count += 1
+                                if symbol not in fetched:
                                     continue
-
-                                fund_df = (
-                                    self.standard_fetcher
-                                    .fetch_quarterly_fundamentals(
-                                        symbol, year, quarter
-                                    )
-                                )
+                                fund_df = fetched[symbol]
+                                if isinstance(fund_df, Exception):
+                                    raise fund_df
+                                statement = self._public_statement(symbol)
+                                extra = statement_on_date(statement, q_end)
+                                if fund_df.empty and extra:
+                                    fund_df = pd.DataFrame(
+                                        [{"end_date": pd.Timestamp(q_end), **extra}]
+                                    ).set_index("end_date")
+                                elif extra and len(fund_df) == 1:
+                                    for name, value in extra.items():
+                                        fund_df[name] = value
 
                                 if not fund_df.empty:
                                     if "end_date" in fund_df.columns:
@@ -454,11 +531,14 @@ def download_all_data(
     skip_metadata=False,
     start_date=None,
     valuation_only=False,
+    full_history=False,
 ):
     """
     Main download function with auto-incremental logic.
 
     Each symbol automatically starts from MAX(date)+1, no manual resume needed.
+    ``full_history`` restores the upstream full-range monthly sampling for a
+    full-history rebuild; daily incremental runs keep the 24-month window.
     """
     with ProcessLock(LOCK_FILE):
         print("=" * 70)
@@ -524,8 +604,20 @@ def download_all_data(
                 }
                 return prefix in valid_prefixes
 
+            # Only recent months can add new listings. Older history is already
+            # covered by stock_pool plus the TDX existing_stocks set, so daily
+            # runs keep a 24-month window instead of ~290 serial network calls.
+            # A full-history rebuild must use the full requested range.
+            sample_floor = (
+                start_date_str
+                if full_history
+                else max(
+                    start_date_str,
+                    (end_date - timedelta(days=730)).strftime("%Y-%m-%d"),
+                )
+            )
             sample_dates = generate_monthly_start_dates(
-                START_DATE, end_date.strftime("%Y-%m-%d")
+                sample_floor, end_date.strftime("%Y-%m-%d")
             )
 
             # Check cached data
@@ -563,7 +655,11 @@ def download_all_data(
                                          for c in stocks_df["code"].tolist()]
                                 all_stocks.update(codes)
                                 downloader.writer.update_stock_pool(codes, date_obj.date())
-                        downloader.writer.add_sampled_date(date_obj.date())
+                            # Mark the month done only when the API call
+                            # succeeded (an empty result on a non-trading day
+                            # is still a valid sample). An API error is
+                            # therefore retried instead of remembered forever.
+                            downloader.writer.add_sampled_date(date_obj.date())
                     except Exception as e:
                         logger.error(f"Failed to sample {date_str}: {e}")
 
@@ -579,49 +675,55 @@ def download_all_data(
                 for i in range(0, len(stock_pool), BATCH_SIZE)
             ]
 
-            # Check if data is already up to date
-            # Only skip if ALL stocks have been covered AND there are no new trading days
+            # Freshness, not coverage, decides whether a per-symbol pass is
+            # needed. Delisted/ETF symbols legitimately never have valuation
+            # rows, so a nonzero missing_count used to force ~5-7k no-op
+            # network calls on every run (and could never converge).
             check_table = "valuation" if valuation_only else "stocks"
             skip_stock_download = False
 
-            # Count how many stocks in pool are missing from the target table
             existing_symbols = set(downloader.writer.get_existing_stocks(check_table))
             missing_count = len([s for s in stock_pool if s not in existing_symbols])
-
             if missing_count > 0:
-                print(f"\n{missing_count} stocks missing from {check_table} table, will download")
-            else:
-                # All stocks exist, check if there are new trading days
-                global_max_date = downloader.writer.get_max_date(check_table)
-                if global_max_date:
-                    test_start = (datetime.strptime(global_max_date, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
-                    if test_start > end_date_str:
-                        print(f"\n{check_table.capitalize()} data already up to date (max_date: {global_max_date})")
+                print(f"\n{missing_count} symbols lack {check_table} rows (delisted/ETF); "
+                      "this does not require a full-pool re-download")
+
+            global_max_date = downloader.writer.get_max_date(check_table)
+            if global_max_date:
+                test_start = (datetime.strptime(global_max_date, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+                if test_start > end_date_str:
+                    print(f"\n{check_table.capitalize()} data already up to date (max_date: {global_max_date})")
+                    skip_stock_download = True
+                else:
+                    # Use the local calendar first: asking the network whether
+                    # a trading day exists costs a request and a transient
+                    # failure used to trigger the entire per-symbol pass.
+                    try:
+                        new_trading_days = downloader.writer.conn.execute(
+                            "SELECT COUNT(*) FROM trade_days WHERE date >= ? AND date <= ?",
+                            [test_start, end_date_str],
+                        ).fetchone()[0]
+                    except Exception:
+                        new_trading_days = -1  # unknown calendar -> probe the network
+                    if new_trading_days == 0:
+                        print(f"\nNo trading days between {test_start} and {end_date_str}; "
+                              "skipping stock download.")
                         skip_stock_download = True
-                    else:
+                    elif new_trading_days > 0 or new_trading_days == -1:
                         try:
                             test_df = downloader.unified_fetcher.fetch_unified_daily_data(
                                 "000001.SZ", test_start, end_date_str
                             )
                             if test_df.empty:
-                                print(f"\n{check_table.capitalize()} data already up to date (max_date: {global_max_date})")
-                                print("No new trading days since last update, skipping stock download.")
                                 skip_stock_download = True
                         except Exception:
-                            pass  # If check fails, proceed with download
+                            pass  # If the probe fails, proceed with download
 
-            # Even without new trading days, stocks missing industry blocks
-            # still need a metadata pass (legacy DBs may have none).
-            if skip_stock_download and not downloader.skip_metadata:
-                missing_blocks = downloader.writer.conn.execute(
-                    "SELECT COUNT(*) FROM stock_metadata WHERE blocks IS NULL"
-                ).fetchone()[0]
-                if missing_blocks > 0:
-                    print(
-                        f"\n{missing_blocks} stocks missing industry blocks, "
-                        "downloading metadata..."
-                    )
-                    skip_stock_download = False
+            # Legacy DBs can have NULL industry blocks, but this must NOT
+            # force a full per-stock download: in valuation-only mode metadata
+            # is never written, so the old gate could never converge (it
+            # re-triggered ~5-7k no-op symbol iterations every run). Metadata
+            # repair belongs in a dedicated job with its own progress ledger.
 
             if skip_stock_download:
                 all_metadata = []
@@ -701,15 +803,15 @@ def download_all_data(
             if not valuation_only:
                 print("  Trading calendar...")
                 try:
-                    trade_cal = downloader.standard_fetcher.fetch_trade_calendar(
+                        trade_cal = downloader.standard_fetcher.fetch_trade_calendar(
                         start_date_str, end_date_str
-                    )
-                    if not trade_cal.empty:
-                        trade_days = trade_cal[trade_cal["is_trading_day"] == "1"]
-                        trade_days = trade_days.rename(
-                            columns={"calendar_date": "trade_date"}
                         )
-                        downloader.writer.write_trade_days(trade_days)
+                        if not trade_cal.empty:
+                            trade_days = trade_cal[trade_cal["is_trading_day"] == "1"]
+                            trade_days = trade_days.rename(
+                                columns={"calendar_date": "trade_date"}
+                            )
+                            downloader.writer.write_trade_days(trade_days)
                         print(f"    {len(trade_days)} days")
                 except Exception as e:
                     logger.error(f"Failed to download trading calendar: {e}")
@@ -719,66 +821,91 @@ def download_all_data(
                 BENCHMARK_INDEX = BENCHMARK_CONFIG["default_index"]
                 print(f"  Benchmark index ({BENCHMARK_INDEX})...")
                 try:
-                    benchmark_df = downloader.unified_fetcher.fetch_index_data(
+                        benchmark_df = downloader.unified_fetcher.fetch_index_data(
                         BENCHMARK_INDEX, start_date_str, end_date_str
-                    )
-                    if not benchmark_df.empty:
-                        downloader.writer.write_benchmark(benchmark_df)
-                        print(f"    {len(benchmark_df)} days")
+                        )
+                        if not benchmark_df.empty:
+                            downloader.writer.write_benchmark(benchmark_df)
+                            print(f"    {len(benchmark_df)} days")
                 except Exception as e:
                     logger.error(f"Failed to download benchmark: {e}")
 
-            # Index constituents (use month-end sampling to match PTrade)
-            # Check existing data to skip already downloaded dates
+            # Index constituents: only recent month-ends can change. The old
+            # loop queried 432 month-ends x 3 indices serially on every run;
+            # historical months have no upstream data, and because empty
+            # results were never recorded they were retried forever.
             print("  Index constituents...")
-            try:
-                # Get existing index constituent dates
-                existing_dates = set()
+            if skip_stock_download:
+                print("    No new trading day; constituents unchanged, skipping.")
+            else:
                 try:
-                    result = downloader.writer.conn.execute(
-                        "SELECT DISTINCT date FROM index_constituents"
-                    ).fetchall()
-                    existing_dates = {row[0] for row in result}
-                except Exception:
-                    pass
+                    attempted_path = db_path.parent / "index_constituents_attempted.json"
+                    try:
+                        attempted = set(json.loads(attempted_path.read_text(encoding="utf-8")))
+                    except Exception:
+                        attempted = set()
 
-                index_sample_dates = generate_monthly_end_dates(
-                    START_DATE, end_date.strftime("%Y-%m-%d")
-                )
+                    existing_keys = set()
+                    try:
+                        rows = downloader.writer.conn.execute(
+                            "SELECT DISTINCT date, index_code FROM index_constituents"
+                        ).fetchall()
+                        existing_keys = {f"{r[0]}|{r[1]}" for r in rows}
+                    except Exception:
+                        pass
 
-                # Filter to only new dates
-                new_dates = [d for d in index_sample_dates if d.strftime("%Y%m%d") not in existing_dates]
+                    index_floor = (
+                        start_date_str
+                        if full_history
+                        else max(
+                            start_date_str,
+                            (end_date - timedelta(days=730)).strftime("%Y-%m-%d"),
+                        )
+                    )
+                    index_sample_dates = generate_monthly_end_dates(
+                        index_floor, end_date.strftime("%Y-%m-%d")
+                    )
+                    index_codes = ["000016.SS", "000300.SS", "000905.SS"]
+                    keys = [
+                        (d.strftime("%Y%m%d"), code)
+                        for d in index_sample_dates
+                        for code in index_codes
+                        if f"{d.strftime('%Y%m%d')}|{code}" not in existing_keys
+                        and f"{d.strftime('%Y%m%d')}|{code}" not in attempted
+                    ]
 
-                if not new_dates:
-                    print(f"    All {len(index_sample_dates)} dates already downloaded")
-                else:
-                    print(f"    Downloading {len(new_dates)} new dates (skipping {len(existing_dates)} existing)...")
-                    for date_obj in new_dates:
-                        date_str = date_obj.strftime("%Y%m%d")
+                    if not keys:
+                        print(f"    All {len(index_sample_dates)} month-ends accounted for")
+                    else:
+                        print(f"    Querying {len(keys)} (date, index) pairs...")
+                        from simtradedata.utils.code_utils import convert_to_ptrade_code
 
-                        for index_code in ["000016.SS", "000300.SS", "000905.SS"]:
+                        for date_str, index_code in keys:
+                            key = f"{date_str}|{index_code}"
                             try:
                                 stocks_df = downloader.standard_fetcher.fetch_index_stocks(
-                                    index_code, date_obj.strftime("%Y-%m-%d")
+                                    index_code,
+                                    f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]}",
                                 )
                                 if not stocks_df.empty:
-                                    from simtradedata.utils.code_utils import (
-                                        convert_to_ptrade_code,
-                                    )
-
-                                    ptrade_codes = [
-                                        convert_to_ptrade_code(code, "baostock")
-                                        for code in stocks_df["code"].tolist()
-                                    ]
                                     downloader.writer.write_index_constituents(
-                                        date_str, index_code, ptrade_codes
+                                        date_str, index_code,
+                                        [convert_to_ptrade_code(code, "baostock")
+                                         for code in stocks_df["code"].tolist()],
                                     )
                             except Exception as e:
+                                # Transient failures must be retried next run;
+                                # only a successful query (or a confirmed
+                                # empty upstream result) is an accounted state.
                                 logger.warning(f"Index {index_code} {date_str}: {e}")
-
-                    print(f"    Done ({len(new_dates)} dates)")
-            except Exception as e:
-                logger.error(f"Failed to download index constituents: {e}")
+                            else:
+                                attempted.add(key)
+                        attempted_path.write_text(
+                            json.dumps(sorted(attempted)), encoding="utf-8"
+                        )
+                        print(f"    Done ({len(keys)} pairs)")
+                except Exception as e:
+                    logger.error(f"Failed to download index constituents: {e}")
 
         finally:
             try:

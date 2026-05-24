@@ -14,6 +14,8 @@ Output: DuckDB database (data/cn.duckdb)
 """
 
 import argparse
+import os
+import sys
 import logging
 import socket
 import warnings
@@ -28,7 +30,6 @@ from tqdm import tqdm  # noqa: E402
 
 from simtradedata.config.field_mappings import (  # noqa: E402
     BENCHMARK_CONFIG,
-    CN_HISTORY_START,
 )
 from simtradedata.fetchers.mootdx_unified_fetcher import MootdxUnifiedFetcher  # noqa: E402
 from simtradedata.router import SmartRouter  # noqa: E402
@@ -40,8 +41,9 @@ OUTPUT_DIR = "data"
 LOG_FILE = "data/download_mootdx.log"
 LOCK_FILE = "data/.download_mootdx.lock"
 
-# Date range
-START_DATE = "2015-01-01"
+# Date range. START_DATE is the legacy 2015 package floor; full-history
+# rebuilds override it with SIMTRADE_CN_HISTORY_START at import time.
+START_DATE = os.environ.get("SIMTRADE_CN_HISTORY_START") or "2015-01-01"
 END_DATE = None  # None means current date
 
 # Batch size for stock processing
@@ -72,6 +74,11 @@ def _latest_stock_coverage(
         return 0, 0, 0.0
     latest_count = len(stock_set & current_symbols)
     return latest_count, total, latest_count / total
+
+# Use the shared, non-blocking ProcessLock from simtradedata.utils. The old
+# local redefinition shadowed it with a FileLock(timeout=-1) (blocks forever)
+# and unlinked the lock file on release, letting a contender lock a fresh
+# inode and enter concurrently.
 
 
 class MootdxDownloader:
@@ -281,11 +288,9 @@ class MootdxDownloader:
         result["bonus_ps"] = fenhong_ps
         result["dividend"] = fenhong_ps
 
-        # Deployment floor: sparse-refill re-downloads full XDXR history, so drop
-        # pre-floor rows here to match TDX import behavior.
-        if CN_HISTORY_START:
-            result = result[result["date"] >= pd.to_datetime(CN_HISTORY_START)]
-
+        # XDXR events are required for adjusted-price calculations on later
+        # bars. Keep full corporate-action history even when a deployment floor
+        # trims daily OHLCV; the integrity gate intentionally exempts exrights.
         return result
 
     def download_batch(
@@ -335,13 +340,14 @@ class MootdxDownloader:
         all stocks' data - much more efficient than per-stock queries.
 
         Incremental strategy:
-        - Recent quarters (last RECENT_QUARTERS_TO_REFRESH): always re-download
-          because financial reports may be updated after initial publication.
-        - Historical quarters: skip if already completed.
+        - Historical completed quarters: never re-fetch (immutable).
+        - Recent quarters: re-fetch only when the upstream hash differs from
+          fundamentals_progress.file_hash, so revisions still land.
+        - New quarters: always fetch.
         - refresh=True: force re-download all quarters.
 
-        TDX server hashes are NOT used for change detection because distributed
-        TDX servers return inconsistent hashes for the same file.
+        Repeated listings of the TDX report catalog were measured as stable
+        (148/148 identical md5 values), so hash-based change detection is used.
         """
         from simtradedata.fetchers.mootdx_affair_fetcher import MootdxAffairFetcher
         from simtradedata.utils.ttm_calculator import get_quarters_in_range
@@ -363,13 +369,16 @@ class MootdxDownloader:
         # Get already completed quarters
         completed_quarters = self.writer.get_completed_fundamental_quarters()
 
-        # Batch fetch remote file info (for availability check)
+        # Batch fetch remote file info (availability + content fingerprint).
+        # An empty/failed listing must abort the stage: the old fallback made
+        # every quarter look "not available" and silently skipped 144 quarters.
         try:
             remote_files = affair_fetcher.list_available_reports()
             remote_hash_map = {f.get("filename"): f.get("hash") for f in remote_files}
         except Exception as e:
-            logger.warning(f"Failed to fetch remote file list: {e}")
-            remote_hash_map = {}
+            raise RuntimeError(f"Cannot list TDX financial reports: {e}") from e
+        if not remote_hash_map:
+            raise RuntimeError("TDX financial report list is empty; refusing to skip quarters")
 
         # Determine which recent quarters should always be refreshed
         recent_quarters = set(quarters[-self.RECENT_QUARTERS_TO_REFRESH:])
@@ -394,12 +403,17 @@ class MootdxDownloader:
             is_recent = (year, quarter) in recent_quarters
             is_completed = (year, quarter) in completed_quarters
 
-            if is_completed and not is_recent:
-                # Historical completed quarter: skip
-                skipped += 1
-                continue
+            if is_completed:
+                # Completed historical quarters are immutable: never refetch.
+                # Recent quarters are refetched only when the upstream hash
+                # actually changed, so report revisions still land but a
+                # no-op run no longer re-downloads/rewrites 4 quarters.
+                local_hash = self.writer.get_fundamental_quarter_hash(year, quarter)
+                if not is_recent or (remote_hash and local_hash == remote_hash):
+                    skipped += 1
+                    continue
 
-            # New quarter or recent quarter: download
+            # New quarter, or a recent quarter whose upstream file changed.
             pending.append((year, quarter, filename, remote_hash))
 
         if not pending:
@@ -420,48 +434,35 @@ class MootdxDownloader:
 
                 if fund_df.empty:
                     logger.warning(f"No fundamentals for {year}Q{quarter}")
-                    # Still mark as completed (empty is valid state)
+                    # An empty quarter is a valid state (early years have no
+                    # reports), but don't record the remote hash: a failed
+                    # download must not be remembered as "already up to date".
                     self.writer.mark_fundamental_quarter_completed(
                         year, quarter, 0,
-                        filename=filename, file_hash=remote_hash or ""
+                        filename=filename, file_hash=""
                     )
                     continue
 
-                # Write per-stock fundamentals (INSERT OR REPLACE overwrites
-                # existing records safely, no need to delete old data first)
-                success_count = 0
+                # One upsert per quarter instead of one per symbol: the old
+                # per-stock loop issued ~5k tiny SQL statements per quarter.
                 if "code" in fund_df.columns:
+                    from simtradedata.utils.code_utils import convert_to_ptrade_code
+                    bulk = fund_df.copy()
+                    bulk["symbol"] = [convert_to_ptrade_code(str(c), "qstock")
+                                      for c in bulk["code"]]
+                    stock_count = bulk["symbol"].nunique()
                     self.writer.begin()
                     try:
-                        for code, group in fund_df.groupby("code"):
-                            try:
-                                # Convert code to PTrade format
-                                from simtradedata.utils.code_utils import (
-                                    convert_to_ptrade_code,
-                                )
-                                ptrade_code = convert_to_ptrade_code(
-                                    str(code), "qstock"
-                                )
-
-                                write_df = group.drop(columns=["code"])
-                                if "end_date" in write_df.columns:
-                                    write_df = write_df.sort_values("end_date")
-                                    write_df = write_df.set_index("end_date")
-
-                                self.writer.write_fundamentals(ptrade_code, write_df)
-                                success_count += 1
-                            except Exception as e:
-                                logger.warning(
-                                    f"Failed to write fundamentals for {code}: {e}"
-                                )
-
+                        rows = self.writer.write_fundamentals_bulk(
+                            bulk.drop(columns=["code"])
+                        )
                         # Record progress in same transaction
                         self.writer.mark_fundamental_quarter_completed(
-                            year, quarter, success_count,
+                            year, quarter, stock_count,
                             filename=filename, file_hash=remote_hash or ""
                         )
                         self.writer.commit()
-                        print(f"    Completed: {success_count} stocks")
+                        print(f"    Completed: {rows} rows / {stock_count} stocks")
                     except Exception:
                         self.writer.rollback()
                         raise

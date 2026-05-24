@@ -33,6 +33,23 @@ tasks:
     publish_targets_allowed:
     failure_policy: Fail the workflow and preserve the report; no repair, publishing, or unbounded retry.
 
+  - id: qmt_local_dat_health
+    name: Local QMT DAT freshness and decodability
+    level: daily
+    quality_goal: Detect missing, corrupt or stale QMT daily / 5m / 1m / finance DAT files without importing the QMT SDK, contacting the network or writing to the canonical DuckDB.
+    owner: SimTradeData
+    schedule: daily after the QMT client refresh
+    trigger: local scheduled task on the Windows host with SIMTRADE_QMT_ROOT
+    systemd_timer:
+    systemd_service:
+    command: uv run --frozen python -m scripts.check_qmt_dat_health --json-output ops/unified_data/qmt_dat_health.json
+    working_directory: repository checkout on the QMT host
+    logs: ops/unified_data/qmt_dat_health.json
+    may_contact_baostock: false
+    may_publish: false
+    publish_targets_allowed:
+    failure_policy: Report only. One 1m DAT per market is a known warning because true 1m bars were never downloaded in the QMT client; GitHub-hosted runners cannot see this local path, so this task is host-local only.
+
   - id: daily_cn_data
     name: CN daily data refresh
     level: daily

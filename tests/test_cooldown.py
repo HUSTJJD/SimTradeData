@@ -25,11 +25,17 @@ class TestSmartCooldown:
         assert cd.is_in_cooldown("source_a") is True
 
     def test_cooldown_expires(self):
-        config = CooldownConfig(timeout=0.05)
+        # A 50ms window plus a fixed 60ms sleep was flaky under load: a scheduler
+        # delay between record_failure and the first assertion could already
+        # expire the cooldown. Give the "still active" assertion headroom and
+        # poll for expiry instead of relying on one exact sleep.
+        config = CooldownConfig(timeout=0.2)
         cd = SmartCooldown(config=config)
         cd.record_failure("source_a", "timeout")
         assert cd.is_in_cooldown("source_a") is True
-        time.sleep(0.06)
+        deadline = time.monotonic() + 2.0
+        while cd.is_in_cooldown("source_a") and time.monotonic() < deadline:
+            time.sleep(0.01)
         assert cd.is_in_cooldown("source_a") is False
 
     def test_success_resets_consecutive_failures(self):

@@ -654,8 +654,21 @@ def test_release_data_publishes_cos_delta_before_baseline():
     assert '"$archive" "$checksum" || github_ok=false' in source
 
 
+def _git_bash_path(path: Path) -> str:
+    """Render a path the Git-Bash/MSYS tools (tar, find, ...) can consume."""
+    value = path.as_posix()
+    if os.name == "nt" and len(value) > 2 and value[1] == ":":
+        # GNU tar reads "C:" as a remote host, so shell-side paths must be
+        # MSYS-style (/c/...) on Windows; other platforms keep POSIX paths.
+        return f"/{value[0].lower()}{value[2:]}"
+    return value
+
+
 def _write_executable(path: Path, source: str) -> None:
-    path.write_text(textwrap.dedent(source).lstrip("\n"))
+    # Path.write_text() translates "\n" to CRLF on Windows; Git-Bash stubs
+    # need real LF line endings (especially for the shebang line).
+    content = textwrap.dedent(source).lstrip("\n").replace("\r\n", "\n")
+    path.write_bytes(content.encode("utf-8"))
     path.chmod(0o755)
 
 
@@ -688,13 +701,43 @@ def _run_release_script(
     bin_dir.mkdir()
     source_script = Path(__file__).resolve().parents[1] / "scripts" / "release_data.sh"
     release_script = scripts / "release_data.sh"
-    release_script.write_text(source_script.read_text(encoding="utf-8"), encoding="utf-8")
+    # Git Bash prepends /usr/bin to PATH at startup, which would shadow the
+    # harness mktemp stub. Force the harness bin dir first inside the script
+    # copy; the product script on disk is untouched.
+    source_text = source_script.read_text(encoding="utf-8")
+    source_lines = source_text.splitlines(keepends=True)
+    # A shell function beats any PATH lookup, including Git Bash's own
+    # /usr/bin/mktemp which is prepended at process startup.
+    harness_bin = _git_bash_path(bin_dir)
+    shim = (
+        f'export PATH="{harness_bin}:$PATH"\n'
+        f'mktemp() {{ "{harness_bin}/mktemp" "$@"; }}\n'
+    )
+    if source_lines and source_lines[0].startswith("#!"):
+        patched_text = source_lines[0] + shim + "".join(source_lines[1:])
+    else:
+        patched_text = shim + source_text
+    release_script.write_bytes(patched_text.encode("utf-8"))
 
     _write_executable(
         bin_dir / "fake-python",
         """
         #!/usr/bin/env bash
         set -euo pipefail
+        # Windows Python cannot open MSYS-style /c/... paths; they may also be
+        # embedded inside -c code strings, so rewrite every /x/ prefix into a
+        # native X:/ prefix before handing arguments to REAL_PYTHON.
+        _to_native_args() {
+          local arg value drive
+          NATIVE_ARGS=()
+          for arg in "$@"; do
+            value="$arg"
+            for drive in a b c d e f g h i j k l m n o p q r s t u v w x y z; do
+              value="${value//\/$drive\//${drive^}:/}"
+            done
+            NATIVE_ARGS+=("$value")
+          done
+        }
         if [[ "$1" == */cos_upload.py ]]; then
           shift
           args=("$@")
@@ -725,10 +768,11 @@ def _run_release_script(
               if [[ "$1" == "--data-manifest" ]]; then manifest="$2"; break; fi
               shift
             done
-            metadata=$("$REAL_PYTHON" -c 'import json,sys
+            _to_native_args -c 'import json,sys
 m=json.load(open(sys.argv[1])); delta=m.get("package_format")=="simtradedata_api_delta_v1"
 tag=("data-{}-{}-to-{}-delta".format(m["market"].lower(),m["from_version"],m["to_version"]) if delta else "data-{}-{}".format(m["market"].lower(),m["version"]))
-print("|".join((tag, "delta" if delta else "baseline", m.get("from_version", ""), m.get("to_version", m.get("version", "")))))' "$manifest")
+print("|".join((tag, "delta" if delta else "baseline", m.get("from_version", ""), m.get("to_version", m.get("version", "")))))' "$manifest"
+            metadata=$("$REAL_PYTHON" "${NATIVE_ARGS[@]}")
             printf '%s|%s|%s\n' "$phase" "$metadata" "$file" >> "$UPLOAD_LOG"
             if [[ "$file" == "data-cn-2026-07-10.tar.gz" && "$BASELINE_MODE" == "fail" ]]; then
               exit 1
@@ -740,7 +784,8 @@ print("|".join((tag, "delta" if delta else "baseline", m.get("from_version", "")
           fi
           exit 2
         fi
-        exec "$REAL_PYTHON" "$@"
+        _to_native_args "$@"
+        exec "$REAL_PYTHON" "${NATIVE_ARGS[@]}"
         """,
     )
     _write_executable(
@@ -748,6 +793,17 @@ print("|".join((tag, "delta" if delta else "baseline", m.get("from_version", "")
         """
         #!/usr/bin/env bash
         set -euo pipefail
+        _to_native_args() {
+          local arg value drive
+          NATIVE_ARGS=()
+          for arg in "$@"; do
+            value="$arg"
+            for drive in a b c d e f g h i j k l m n o p q r s t u v w x y z; do
+              value="${value//\/$drive\//${drive^}:/}"
+            done
+            NATIVE_ARGS+=("$value")
+          done
+        }
         script="$1"
         shift
         if [[ "$script" == "scripts/export_parquet.py" ]]; then
@@ -783,7 +839,8 @@ print("|".join((tag, "delta" if delta else "baseline", m.get("from_version", "")
           rm -rf "$package"
           exit 0
         fi
-        exec "$REAL_PYTHON" "$script" "$@"
+        _to_native_args "$script" "$@"
+        exec "$REAL_PYTHON" "${NATIVE_ARGS[@]}"
         """,
     )
     _write_executable(
@@ -807,7 +864,7 @@ print("|".join((tag, "delta" if delta else "baseline", m.get("from_version", "")
     mktemp_log = tmp_path / "mktemp.log"
     env = {
         **os.environ,
-        "PATH": f"{bin_dir}:/usr/bin:/bin",
+        "PATH": f"{_git_bash_path(bin_dir)}:/usr/bin:/bin",
         "PYTHON": str(bin_dir / "python-stub"),
         "COS_UPLOAD_PYTHON": str(bin_dir / "fake-python"),
         "COS_SECRET_ID": "sid",
@@ -819,10 +876,10 @@ print("|".join((tag, "delta" if delta else "baseline", m.get("from_version", "")
         "LOOKUP_MODE": lookup_mode,
         "DELTA_INDEX_MODE": delta_index_mode,
         "UPLOAD_LOG": str(upload_log),
-        "MKTEMP_LOG": str(mktemp_log),
+        "MKTEMP_LOG": _git_bash_path(mktemp_log),
         "PRUNE_LOG": str(tmp_path / "prune.log"),
         "PRUNE_MODE": prune_mode,
-        "HARNESS_TMP": str(tmp_path),
+        "HARNESS_TMP": _git_bash_path(tmp_path),
         "REAL_PYTHON": sys.executable,
     }
     result = subprocess.run(
@@ -838,7 +895,7 @@ print("|".join((tag, "delta" if delta else "baseline", m.get("from_version", "")
             "--cos-region",
             "region",
             "--local-release-dir",
-            str(tmp_path / "local"),
+            _git_bash_path(tmp_path / "local"),
         ],
         env=env,
         text=True,

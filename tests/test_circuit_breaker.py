@@ -11,6 +11,18 @@ from simtradedata.resilience.circuit_breaker import (
 )
 
 
+def _wait_half_open(cb: CircuitBreaker, deadline_seconds: float = 2.0) -> None:
+    """Poll for the OPEN -> HALF_OPEN transition.
+
+    ``CircuitBreaker.state`` is a property that performs the transition on
+    read, so a fixed sleep races with scheduler delays under load. Polling
+    asserts the same behaviour without depending on exact wall-clock timing.
+    """
+    deadline = time.monotonic() + deadline_seconds
+    while cb.state is not CircuitState.HALF_OPEN and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+
 @pytest.mark.unit
 class TestCircuitBreaker:
     """Tests for CircuitBreaker state transitions."""
@@ -19,7 +31,7 @@ class TestCircuitBreaker:
         self,
         failure_threshold: int = 3,
         success_threshold: int = 2,
-        timeout: float = 0.05,
+        timeout: float = 0.3,
     ) -> CircuitBreaker:
         """Create a circuit breaker with fast-test defaults."""
         config = CircuitBreakerConfig(
@@ -57,23 +69,24 @@ class TestCircuitBreaker:
         assert cb.state is CircuitState.CLOSED
 
     def test_transitions_to_half_open_after_timeout(self):
-        cb = self._make_breaker(failure_threshold=3, timeout=0.05)
+        # 300ms gives the OPEN assertion headroom under load; polling replaces
+        # the old fixed 60ms sleep that raced with the state property.
+        cb = self._make_breaker(failure_threshold=3, timeout=0.3)
         for _ in range(3):
             cb.record_failure()
         assert cb.state is CircuitState.OPEN
-        time.sleep(0.06)
+        _wait_half_open(cb)
         assert cb.state is CircuitState.HALF_OPEN
 
     def test_half_open_closes_on_success_threshold(self):
         cb = self._make_breaker(
-            failure_threshold=3, success_threshold=2, timeout=0.05,
+            failure_threshold=3, success_threshold=2, timeout=0.3,
         )
         # Drive to OPEN.
         for _ in range(3):
             cb.record_failure()
         assert cb.state is CircuitState.OPEN
-        # Wait for timeout to reach HALF_OPEN.
-        time.sleep(0.06)
+        _wait_half_open(cb)
         assert cb.state is CircuitState.HALF_OPEN
         # Meet the success threshold.
         cb.record_success()
@@ -81,13 +94,12 @@ class TestCircuitBreaker:
         assert cb.state is CircuitState.CLOSED
 
     def test_half_open_reopens_on_failure(self):
-        cb = self._make_breaker(failure_threshold=3, timeout=0.05)
+        cb = self._make_breaker(failure_threshold=3, timeout=0.3)
         # Drive to OPEN.
         for _ in range(3):
             cb.record_failure()
         assert cb.state is CircuitState.OPEN
-        # Wait for timeout to reach HALF_OPEN.
-        time.sleep(0.06)
+        _wait_half_open(cb)
         assert cb.state is CircuitState.HALF_OPEN
         # A single failure should reopen.
         cb.record_failure()

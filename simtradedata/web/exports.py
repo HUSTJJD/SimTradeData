@@ -59,7 +59,8 @@ def export_bundle(data_dir, market):
     temporary = output.with_suffix('.tmp')
     try:
         emit(stage='export', message='正在导出股票与ETF行情', completed=0, total=7)
-        with DuckDBWriter(str(database)) as writer:
+        writer = DuckDBWriter(str(database))
+        try:
             where = writer._cn_stock_filter_sql('s.symbol') if market == 'cn' else 'TRUE'
             rows = writer.conn.execute(f'SELECT COUNT(*) FROM stocks s WHERE {where}').fetchone()[0]
             if not rows:
@@ -77,14 +78,16 @@ def export_bundle(data_dir, market):
                       'fundamentals': '财务导出完成', 'valuation': '估值导出完成', 'metadata': '元数据导出完成'}
             writer.export_to_parquet(str(stage), market=market,
                 progress_callback=lambda name, step: emit(stage='export', message='正在导出股票与ETF行情' if name == 'stocks' and step < 1 else labels[name], completed=step, total=7))
+        finally:
+            writer.close()
         counts = {}
         for folder in ['stocks', 'exrights', 'fundamentals', 'valuation', 'metadata']:
             files = list((stage / folder).glob('*.parquet'))
             counts[folder] = len(files)
             for path in files:
-                table = pq.ParquetFile(path)
-                if folder == 'stocks' and not {'date','open','high','low','close','volume','money','preclose','high_limit','low_limit'} <= set(table.schema.names):
-                    raise ValueError(f'{path.name}: 导出行情字段不符合格式规范')
+                with pq.ParquetFile(path) as table:
+                    if folder == 'stocks' and not {'date','open','high','low','close','volume','money','preclose','high_limit','low_limit'} <= set(table.schema.names):
+                        raise ValueError(f'{path.name}: 导出行情字段不符合格式规范')
         counts['etfs'] = sum(is_exchange_etf(path.stem) for path in (stage / 'stocks').glob('*.parquet'))
         counts['stocks'] -= counts['etfs']
         counts['etf_pcf'] = 0

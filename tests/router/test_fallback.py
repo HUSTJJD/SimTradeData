@@ -65,14 +65,28 @@ def _stub_fetch_from(fetcher, source_name):
     return fetcher.fetch_daily_data("600000.SS", "2024-01-01", "2024-12-31")
 
 
+def _unexpected(*_args):
+    pytest.fail("Unexpected fallback")
+
+
+def _no_fallbacks(router):
+    """Guard every source behind the one under test."""
+    router._fetchers.update({
+        "akshare": SimpleNamespace(fetch_reconciled_daily=_unexpected),
+        "adata": SimpleNamespace(fetch_reconciled_daily=_unexpected),
+        "efinance": SimpleNamespace(fetch_reconciled_daily=_unexpected),
+        "mootdx": SimpleNamespace(fetch_daily_data=_unexpected),
+    })
+
+
 @pytest.mark.parametrize("first_result", ["error", "empty"])
-def test_default_daily_query_falls_back_from_mootdx_to_baostock(first_result):
+def test_default_daily_query_falls_back_from_public_to_baostock(first_result):
     calls = []
 
-    def mootdx(*args):
-        calls.append("mootdx")
+    def public(*args):
+        calls.append("public")
         if first_result == "error":
-            raise ConnectionError("TDX source unavailable")
+            raise ConnectionError("HTTP source unavailable")
         return pd.DataFrame()
 
     def eastmoney(*args):
@@ -85,42 +99,73 @@ def test_default_daily_query_falls_back_from_mootdx_to_baostock(first_result):
 
     router = SmartRouter()
     router._fetchers.update({
-        "mootdx": SimpleNamespace(fetch_daily_data=mootdx),
+        "public": SimpleNamespace(fetch_reconciled_daily=public),
         "eastmoney": SimpleNamespace(fetch_daily_bars=eastmoney),
         "baostock": SimpleNamespace(fetch_unified_daily_data=baostock),
     })
+    _no_fallbacks(router)
     result = router.get_daily_bars("600000.SS", "2024-01-01", "2024-01-02")
-    assert calls == ["mootdx", "eastmoney", "baostock"]
+    assert calls == ["public", "eastmoney", "baostock"]
     assert result.iloc[0]["close"] == 10.5
 
 
-def test_default_daily_query_uses_mootdx_before_http_sources():
+def test_default_daily_query_uses_public_before_http_sources():
     router = SmartRouter()
     router._fetchers.update({
-        "mootdx": StubFetcherOK(),
-        "eastmoney": SimpleNamespace(
-            fetch_daily_bars=lambda *args: pytest.fail("Unexpected fallback")
+        "public": SimpleNamespace(
+            fetch_reconciled_daily=StubFetcherOK().fetch_daily_data
         ),
-        "baostock": SimpleNamespace(
-            fetch_unified_daily_data=lambda *args: pytest.fail("Unexpected fallback")
-        ),
+        "eastmoney": SimpleNamespace(fetch_daily_bars=_unexpected),
+        "baostock": SimpleNamespace(fetch_unified_daily_data=_unexpected),
     })
+    _no_fallbacks(router)
     result = router.get_daily_bars("510300.SS", "2024-01-01", "2024-01-02")
     assert result.iloc[0]["close"] == 10.5
 
 
-def test_default_daily_query_uses_eastmoney_when_mootdx_is_empty():
+def test_default_daily_query_uses_eastmoney_when_public_is_empty():
     router = SmartRouter()
     router._fetchers.update({
-        "mootdx": StubFetcherEmpty(),
+        "public": SimpleNamespace(
+            fetch_reconciled_daily=StubFetcherEmpty().fetch_daily_data
+        ),
         "eastmoney": SimpleNamespace(
             fetch_daily_bars=StubFetcherOK().fetch_daily_data
         ),
-        "baostock": SimpleNamespace(
-            fetch_unified_daily_data=lambda *args: pytest.fail("Unexpected fallback")
-        ),
+        "baostock": SimpleNamespace(fetch_unified_daily_data=_unexpected),
     })
+    _no_fallbacks(router)
     result = router.get_daily_bars("510300.SS", "2024-01-01", "2024-01-02")
+    assert result.iloc[0]["close"] == 10.5
+
+
+def test_default_daily_query_falls_back_to_upstream_mootdx_as_last_resort():
+    """Upstream TDX daily bars must stay reachable when every HTTP source fails."""
+    calls = []
+
+    def fail(name):
+        def _fail(*args):
+            calls.append(name)
+            raise ConnectionError(f"{name} unavailable")
+        return _fail
+
+    def mootdx(*args):
+        calls.append("mootdx")
+        return StubFetcherOK().fetch_daily_data(*args)
+
+    router = SmartRouter()
+    router._fetchers.update({
+        "public": SimpleNamespace(fetch_reconciled_daily=fail("public")),
+        "eastmoney": SimpleNamespace(fetch_daily_bars=fail("eastmoney")),
+        "baostock": SimpleNamespace(fetch_unified_daily_data=fail("baostock")),
+        "akshare": SimpleNamespace(fetch_reconciled_daily=fail("akshare")),
+        "adata": SimpleNamespace(fetch_reconciled_daily=fail("adata")),
+        "efinance": SimpleNamespace(fetch_reconciled_daily=fail("efinance")),
+        "mootdx": SimpleNamespace(fetch_daily_data=mootdx),
+    })
+    result = router.get_daily_bars("600000.SS", "2024-01-01", "2024-01-02")
+    assert calls[-1] == "mootdx"
+    assert len(calls) == 7
     assert result.iloc[0]["close"] == 10.5
 
 
@@ -166,6 +211,14 @@ class TestTryFetch:
         self._inject(router, "s1", StubFetcherFail())
         with pytest.raises(DataSourceError, match="s1"):
             router._try_fetch("daily_bars", _stub_fetch_from, symbol="600000.SS")
+
+    def test_all_optional_sources_missing_raises(self, monkeypatch):
+        router = self._make_router(["akshare", "adata"])
+        def missing(_name):
+            raise ModuleNotFoundError("optional package not installed")
+        monkeypatch.setattr(router, "_get_fetcher", missing)
+        with pytest.raises(DataSourceError, match="optional packages missing"):
+            router._try_fetch("daily_bars", _stub_fetch_from, market="cn")
 
     def test_no_source_for_market_raises(self):
         router = self._make_router(["s1"])

@@ -219,3 +219,15 @@ research/
 output/
 webadmin/frontend/node_modules
 /simtradedata/web/static/
+*.parquet
+*.duckdb
+*.zip
+*.gz
+.pytest_basetemp_20261126_recheck/
+.pytest_basetemp_20261126_full/
+
+# One-off investigation scripts and generated reports are archived locally,
+# never versioned (see scratch/README.md).
+/scratch/*
+!/scratch/README.md
+ops/unified_data/*.md

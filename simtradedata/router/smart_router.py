@@ -14,6 +14,9 @@ _MARKET_SUFFIXES = {
     "SS": "cn",
     "SZ": "cn",
     "BJ": "cn",
+    "SH": "cn",
+    "XSHG": "cn",
+    "XSHE": "cn",
     "US": "us",
 }
 
@@ -130,9 +133,21 @@ class SmartRouter:
         sources = self._resolve_sources(data_type, market)
         errors = []
         skipped_unhealthy = []
+        skipped_optional = []
 
         for source_name in sources:
-            fetcher = self._get_fetcher(source_name)
+            try:
+                fetcher = self._get_fetcher(source_name)
+            except ModuleNotFoundError as e:
+                # Optional OSS adapters are best-effort supplements. A missing
+                # package must not prevent first-party sources from serving,
+                # but "everything skipped" must not look like a successful
+                # empty result (upstream raises DataSourceError in that case).
+                if source_name in {"akshare", "adata", "efinance"}:
+                    logger.info("Skipping optional source %s: %s", source_name, e)
+                    skipped_optional.append(source_name)
+                    continue
+                raise
 
             if not self._is_source_healthy(fetcher):
                 logger.debug("Skipping %s: circuit breaker open", source_name)
@@ -167,6 +182,16 @@ class SmartRouter:
                 f"All sources skipped for {data_type}: "
                 f"{', '.join(skipped_unhealthy)} (circuit breaker open)"
             )
+        if (
+            skipped_optional
+            and not errors
+            and not skipped_unhealthy
+            and len(skipped_optional) == len(sources)
+        ):
+            raise DataSourceError(
+                f"All configured sources unavailable for {data_type}: "
+                f"{', '.join(skipped_optional)} (optional packages missing)"
+            )
         return pd.DataFrame()
 
     # -- Public API --
@@ -180,6 +205,8 @@ class SmartRouter:
         def fetch_from(fetcher, source_name):
             if source_name == "mootdx":
                 df = fetcher.fetch_daily_data(symbol, start_date, end_date)
+            elif source_name in {"public", "akshare", "adata", "efinance"}:
+                df = fetcher.fetch_reconciled_daily(symbol, start_date, end_date)
             elif source_name == "eastmoney":
                 df = fetcher.fetch_daily_bars(symbol, start_date, end_date)
             elif source_name == "baostock":
@@ -370,9 +397,31 @@ class SmartRouter:
         """
 
         def fetch_from(fetcher, source_name):
-            return fetcher.fetch_minute_bars(symbol, frequency, offset)
+            df = fetcher.fetch_minute_bars(symbol, frequency, offset)
+            if (
+                source_name == "public"
+                and int(frequency) == 7
+                and df is not None
+                and not df.empty
+            ):
+                from simtradedata.writers.minute_store import append_minute_bars
+
+                return append_minute_bars(symbol, df)
+            return df
 
         return self._try_fetch("minute_bars", fetch_from, symbol=symbol)
+
+    def get_fund_bars(self, symbol, start_date, end_date):
+        """场内基金 / ETF 日线。"""
+
+        def fetch_from(fetcher, source_name):
+            if source_name == "public" and hasattr(fetcher, "fetch_reconciled_daily"):
+                return fetcher.fetch_reconciled_daily(symbol, start_date, end_date)
+            if hasattr(fetcher, "fetch_fund_bars"):
+                return fetcher.fetch_fund_bars(symbol, start_date, end_date)
+            return fetcher.fetch_daily_bars(symbol, start_date, end_date)
+
+        return self._try_fetch("fund_bars", fetch_from, symbol=symbol)
 
     def get_fundamentals(self, symbol=None, year=None, quarter=None):
         """Fetch financial fundamentals.

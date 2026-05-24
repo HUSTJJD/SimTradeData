@@ -7,9 +7,13 @@ import pandas as pd
 import pytest
 
 from scripts import check_integrity as integrity
+from simtradedata.config import field_mappings as fm
 
 
-def _create_floor_db(path, *, metadata_date="20050430", status_date="20050430"):
+def _create_floor_db(
+    path, *, metadata_date="20050430", status_date="20050430",
+    benchmark_date="2005-05-09",
+):
     conn = duckdb.connect(str(path))
     try:
         conn.execute("CREATE TABLE stocks (symbol VARCHAR, date DATE)")
@@ -28,7 +32,8 @@ def _create_floor_db(path, *, metadata_date="20050430", status_date="20050430"):
             "INSERT INTO stock_metadata VALUES ('000001.SZ', '2900-01-01', '1', '{\"ZJHHY\": []}')"
         )
         conn.execute(
-            "INSERT INTO benchmark VALUES ('2005-05-09', 1, 1, 1, 1, 1, 1)"
+            "INSERT INTO benchmark VALUES (?, 1, 1, 1, 1, 1, 1)",
+            [benchmark_date],
         )
         conn.execute(
             "INSERT INTO index_constituents VALUES (?, '399005.SZ', ?)",
@@ -104,3 +109,40 @@ def test_integrity_rejects_pre_floor_export_metadata(tmp_path, monkeypatch):
 
     failed = {check["name"] for check in report["checks"] if check["status"] == "fail"}
     assert "stock_status_export_history_floor" in failed
+
+
+def test_benchmark_floor_follows_configured_history_start(monkeypatch):
+    # CSI300 (the default index) only exists from 2005-01-04. A 1990 floor is
+    # clamped to that inception instead of failing an impossible requirement.
+    monkeypatch.setattr(fm, "CN_HISTORY_START", "1990-12-19")
+    assert fm.effective_benchmark_history_floor() == "2005-01-04"
+    assert fm.benchmark_history_ok("2005-01-04")
+    assert not fm.benchmark_history_ok("2015-01-05")
+
+    monkeypatch.setattr(fm, "CN_HISTORY_START", None)
+    assert fm.effective_benchmark_history_floor() == "2015-01-05"
+    assert fm.benchmark_history_ok("2015-01-05")
+
+
+def test_benchmark_floor_not_clamped_for_long_history_index(monkeypatch):
+    """A deployment on the SSE Composite keeps the full 1990 floor."""
+    monkeypatch.setattr(fm, "CN_HISTORY_START", "1990-12-19")
+    monkeypatch.setitem(fm.BENCHMARK_CONFIG, "default_index", "000001.SS")
+    assert fm.effective_benchmark_history_floor() == "1990-12-19"
+    assert fm.benchmark_history_ok("1990-12-19")
+    assert not fm.benchmark_history_ok("2005-01-04")
+
+
+def test_full_history_benchmark_gate_accepts_index_inception(tmp_path, monkeypatch):
+    """The one-shot full-history floor must not fail on CSI300's 2005 start."""
+    db_path = tmp_path / "cn.duckdb"
+    _create_floor_db(db_path, benchmark_date="2005-01-04")
+    monkeypatch.setattr(integrity, "CN_HISTORY_START", "1990-12-19")
+
+    report = integrity.check_integrity(str(db_path), target_date="2005-05-09")
+
+    check = next(
+        c for c in report["checks"] if c["name"] == "benchmark_history_coverage"
+    )
+    assert check["status"] == "pass"
+    assert check["expected"] == "<= 2005-01-04"

@@ -20,8 +20,8 @@ import pandas as pd
 
 from simtradedata.config.field_mappings import (
     BENCHMARK_CONFIG,
-    BENCHMARK_HISTORY_FLOOR,
     benchmark_history_ok,
+    effective_benchmark_history_floor,
 )
 from simtradedata.config.mootdx_finvalue_map import FULL_FUNDAMENTAL_FIELDS
 from simtradedata.utils.paths import DUCKDB_PATH, safe_rmtree
@@ -63,6 +63,12 @@ _FUNDAMENTAL_EXTRA_COLUMNS = [
     "net_profit",
     "np_parent_company_owners",
     "net_operate_cash_flow",
+    "dividend_interest_payment",
+    "oper_cash_ps_grow_rate",
+    "np_parent_company_cut",
+    "np_parent_company_cut_yoy",
+    "net_operate_cash_flow_ttm",
+    "net_operate_cash_flow_ps_ttm",
     "net_invest_cash_flow",
     "net_finance_cash_flow",
     "net_asset_grow_rate",
@@ -258,6 +264,9 @@ class DuckDBWriter:
     def __init__(self, db_path: str = DEFAULT_DB_PATH):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        # Export-path degradations used to be silent (or log-only). Keep them
+        # on the instance so the publish report can record them explicitly.
+        self.export_degradations: list[dict[str, Any]] = []
 
         self.conn = duckdb.connect(str(self.db_path))
         self._init_schema()
@@ -1057,6 +1066,78 @@ class DuckDBWriter:
         self._validate_or_warn(df, "fundamental", symbol)
         return df
 
+    def write_fundamentals_bulk(self, df: pd.DataFrame) -> int:
+        """Upsert a whole quarter with a handful of statements.
+
+        ``write_fundamentals_batch`` validates each company before writing:
+        conflicting quarters without announcement dates are rejected, source
+        ROA is marked as not derived, and the standard validator runs. The
+        bulk path must keep all of that; only the SQL round-trips are
+        collapsed (one statement per distinct column set, not per symbol).
+        """
+        if df.empty:
+            return 0
+        work = df.copy()
+        if "end_date" in work.columns and "date" not in work.columns:
+            work = work.rename(columns={"end_date": "date"})
+        if "symbol" not in work.columns:
+            raise DataQualityError(
+                "write_fundamentals_bulk requires a 'symbol' column"
+            )
+        batches: dict[tuple, list[pd.DataFrame]] = {}
+        for symbol, group in work.groupby("symbol", sort=False):
+            prepared = self._prepare_fundamentals(
+                str(symbol), group.drop(columns=["symbol"])
+            )
+            batches.setdefault(tuple(prepared.columns), []).append(prepared)
+        written = 0
+        for frames in batches.values():
+            batch = pd.concat(frames, ignore_index=True)
+            self._upsert_symbol_rows("fundamentals", batch)
+            written += len(batch)
+        return written
+
+    def fill_statement_fields(self, symbol: str, df: pd.DataFrame) -> int:
+        """把已有报告期上的空列补上。新值是空的时候不覆盖旧值，也不新建行。"""
+        if df is None or df.empty:
+            return 0
+        work = df.copy()
+        if "end_date" in work.columns and "date" not in work.columns:
+            work = work.rename(columns={"end_date": "date"})
+        if "date" not in work.columns:
+            return 0
+        fields = [
+            "dividend_interest_payment",
+            "net_operate_cash_flow",
+            "oper_cash_ps_grow_rate",
+            "np_parent_company_cut",
+            "np_parent_company_cut_yoy",
+            "net_operate_cash_flow_ttm",
+            "net_operate_cash_flow_ps_ttm",
+        ]
+        fields = [name for name in fields if name in work.columns]
+        work["date"] = pd.to_datetime(work["date"]).dt.date
+        updated = 0
+        for row in work.to_dict("records"):
+            assigns = []
+            params = []
+            for name in fields:
+                value = row.get(name)
+                if value is None or pd.isna(value):
+                    continue
+                assigns.append(f"{name} = ?")
+                params.append(float(value))
+            if not assigns:
+                continue
+            params.extend([symbol, row["date"]])
+            self.conn.execute(
+                f"UPDATE fundamentals SET {', '.join(assigns)} "
+                "WHERE symbol = ? AND date = ?",
+                params,
+            )
+            updated += 1
+        return updated
+
     def write_exrights(self, symbol: str, df: pd.DataFrame) -> int:
         """Write exrights data with upsert"""
         if df.empty:
@@ -1445,8 +1526,17 @@ class DuckDBWriter:
                 report["code"] = report["code"].astype(str).str.zfill(6)
                 report["end_date"] = pd.to_datetime(report["end_date"]).dt.date
                 reports[filename] = report.set_index(["code", "end_date"])["roa"]
-            value = reports[filename].get((symbol[:6], day))
-            if isinstance(value, pd.Series) or pd.isna(value) or not math.isfinite(float(value)):
+            try:
+                value = reports[filename].loc[(symbol[:6], day)]
+            except KeyError:
+                value = None
+            # MultiIndex .loc returns a one-row Series even for a unique key,
+            # so the old .get() + isinstance(Series) check rejected every row.
+            # A genuinely duplicated key is still ambiguous and rejected:
+            # upstream's fail-closed semantics are preserved.
+            if isinstance(value, pd.Series):
+                value = value.iloc[0] if len(value) == 1 else None
+            if value is None or pd.isna(value) or not math.isfinite(float(value)):
                 raise ValueError(f"{symbol} {day} 缺少唯一有效的源 ROA；请重新导入季度财务数据后再导出")
             restored.append({"symbol": symbol, "date": day, "roa": float(value)})
         # Validate all source evidence before changing any stored values.
@@ -1554,9 +1644,51 @@ class DuckDBWriter:
     # Export to Parquet
     # ========================================
 
-    def export_to_parquet(self, output_dir: str, market: str = "cn", progress_callback=None) -> None:
-        """Export all data to PTrade Parquet format"""
+    @staticmethod
+    def _reuse_parquet_tree(src: Path, dst: Path) -> int:
+        """Hard-link unchanged parquet files into staging; copy as fallback.
+
+        Hard links are directory entries only: writing a *new* file over a
+        linked name must use os.replace (never open the link for writing), or
+        the live serving file would be mutated. We instead drop the whole
+        linked directory for tables that are being rebuilt.
+        """
+        import shutil
+
+        dst.mkdir(parents=True, exist_ok=True)
+        count = 0
+        for path in src.glob("*.parquet"):
+            target = dst / path.name
+            try:
+                os.link(path, target)
+            except OSError:
+                shutil.copy2(path, target)
+            count += 1
+        return count
+
+    def export_to_parquet(
+        self,
+        output_dir: str,
+        market: str = "cn",
+        progress_callback=None,
+        *,
+        base_dir: str | None = None,
+        changed_tables: set[str] | None = None,
+    ) -> None:
+        """Export to PTrade Parquet, reusing unchanged tables when possible.
+
+        With ``base_dir`` and ``changed_tables``, tables with no changes are
+        hard-linked from the existing serving view into staging instead of
+        being re-exported. Only changed tables plus metadata/manifest are
+        rebuilt. Omitting both arguments performs the original full export.
+        """
         output_path = Path(output_dir)
+        base_path = Path(base_dir) if base_dir else None
+        incremental = (
+            base_path is not None and base_path.is_dir()
+            and changed_tables is not None
+        )
+        rebuilt = set(changed_tables or ()) | {"metadata"}
 
         # Guardrail: cap DuckDB memory so oversized queries spill to disk
         # instead of exhausting the host (the 7GB customer box crashed twice
@@ -1574,31 +1706,44 @@ class DuckDBWriter:
             # Clean output directory to avoid mixing data from different markets
             if output_path.exists():
                 safe_rmtree(output_path)
+            output_path.mkdir(parents=True, exist_ok=True)
 
             for subdir in ["stocks", "exrights", "fundamentals", "valuation", "metadata"]:
-                (output_path / subdir).mkdir(parents=True, exist_ok=True)
+                dst = output_path / subdir
+                src = base_path / subdir if incremental else None
+                if incremental and subdir not in rebuilt and src.is_dir():
+                    reused = self._reuse_parquet_tree(src, dst)
+                    logger.info("Reused %d unchanged %s files from %s", reused, subdir, src)
+                else:
+                    # Rebuilt tables get an empty directory: never write over a
+                    # hard link, which would mutate the live serving file.
+                    dst.mkdir(parents=True, exist_ok=True)
 
-            logger.info("Exporting stocks...")
-            if progress_callback:
-                self._export_stocks_batch(output_path / "stocks", market=market,
-                    progress_callback=lambda done, total: progress_callback('stocks', done / max(total, 1)))
-            else:
-                self._export_stocks_batch(output_path / "stocks", market=market)
+            if not incremental or "stocks" in rebuilt:
+                logger.info("Exporting stocks...")
+                if progress_callback:
+                    self._export_stocks_batch(output_path / "stocks", market=market,
+                        progress_callback=lambda done, total: progress_callback('stocks', done / max(total, 1)))
+                else:
+                    self._export_stocks_batch(output_path / "stocks", market=market)
             if progress_callback:
                 progress_callback('stocks', 1)
 
-            logger.info("Exporting exrights...")
-            self._export_exrights_batch(output_path / "exrights", market=market)
+            if not incremental or "exrights" in rebuilt:
+                logger.info("Exporting exrights...")
+                self._export_exrights_batch(output_path / "exrights", market=market)
             if progress_callback:
                 progress_callback('exrights', 2)
 
-            logger.info("Exporting fundamentals...")
-            self._export_fundamentals_batch(output_path / "fundamentals", market=market)
+            if not incremental or "fundamentals" in rebuilt:
+                logger.info("Exporting fundamentals...")
+                self._export_fundamentals_batch(output_path / "fundamentals", market=market)
             if progress_callback:
                 progress_callback('fundamentals', 3)
 
-            logger.info("Exporting valuation...")
-            self._export_valuation_batch(output_path / "valuation", market=market)
+            if not incremental or "valuation" in rebuilt:
+                logger.info("Exporting valuation...")
+                self._export_valuation_batch(output_path / "valuation", market=market)
             if progress_callback:
                 progress_callback('valuation', 4)
 
@@ -1609,7 +1754,10 @@ class DuckDBWriter:
 
             self._write_manifest(output_path, market=market)
 
-            logger.info(f"Export complete: {output_path}")
+            logger.info(
+                "Export complete: %s (%s)", output_path,
+                "incremental" if incremental else "full",
+            )
         finally:
             self.conn.execute("RESET memory_limit")
             # temp_directory cannot be reset once spill files exist
@@ -1650,7 +1798,7 @@ class DuckDBWriter:
                 WHERE table_name = 'fundamentals'
                   AND symbol IS NOT NULL AND date IS NOT NULL
                   AND date <= ?::DATE
-                  AND (date > ?::DATE OR changed_at::DATE > ?::DATE)
+                  AND (date > ?::DATE OR changed_at >= (?::DATE + INTERVAL 1 DAY))
                 UNION
                 SELECT DISTINCT symbol
                 FROM fundamentals
@@ -1720,7 +1868,7 @@ class DuckDBWriter:
             FROM data_change_log
             WHERE table_name = 'stock_metadata'
               AND symbol IS NOT NULL
-              AND changed_at::DATE > ?::DATE
+              AND changed_at >= (?::DATE + INTERVAL 1 DAY)
             ORDER BY symbol
         """, [base_version]).fetchall()]
 
@@ -1776,7 +1924,7 @@ class DuckDBWriter:
                 WHERE table_name = '{table_name}'
                   AND symbol IS NOT NULL AND date IS NOT NULL
                   AND date <= ?::DATE
-                  AND (date > ?::DATE OR changed_at::DATE > ?::DATE)
+                  AND (date > ?::DATE OR changed_at >= (?::DATE + INTERVAL 1 DAY))
                 UNION
                 SELECT DISTINCT symbol
                 FROM {table_name}
@@ -1833,7 +1981,7 @@ class DuckDBWriter:
                   AND symbol IS NOT NULL
                   AND date IS NOT NULL
                   AND date <= ?::DATE
-                  AND (date > ?::DATE OR changed_at::DATE > ?::DATE)
+                  AND (date > ?::DATE OR changed_at >= (?::DATE + INTERVAL 1 DAY))
                 UNION ALL
                 SELECT DISTINCT symbol, date
                 FROM {temp_table}
@@ -2158,7 +2306,7 @@ class DuckDBWriter:
                   AND symbol IS NOT NULL
                   AND date IS NOT NULL
                   AND date <= ?::DATE
-                  AND (date > ?::DATE OR changed_at::DATE > ?::DATE)
+                  AND (date > ?::DATE OR changed_at >= (?::DATE + INTERVAL 1 DAY))
                 UNION
                 SELECT symbol
                 FROM exrights
@@ -2428,6 +2576,177 @@ class DuckDBWriter:
 
         logger.info(f"Exported {count} exrights files in {time.time() - t0:.1f}s")
 
+    def mark_baseline(self, version: str) -> int:
+        """Record that a full-history rebuild produced a new baseline.
+
+        A full rebuild marks every (symbol, date) as changed, which made
+        data_change_log grow to ~8M rows and forced delta export to re-ship
+        entire histories. After such a rebuild clients must fetch a baseline
+        package, so clear the per-row marks and record the version for the
+        delta endpoint to consult.
+        """
+        removed = self.conn.execute("SELECT COUNT(*) FROM data_change_log").fetchone()[0]
+        self.conn.execute("DELETE FROM data_change_log")
+        self.conn.execute(
+            "INSERT OR REPLACE INTO version_info VALUES ('baseline_version', ?)",
+            [version],
+        )
+        logger.info("baseline marked at %s; cleared %d change-log rows", version, removed)
+        return int(removed)
+
+    def prune_change_log(self, retention_days: int = 30) -> int:
+        """Drop stale per-row change marks; the delta window never needs them."""
+        if retention_days <= 0:
+            return 0
+        from datetime import datetime, timedelta
+
+        cutoff = datetime.now() - timedelta(days=retention_days)
+        removed = self.conn.execute(
+            "SELECT COUNT(*) FROM data_change_log WHERE changed_at < ?",
+            [cutoff],
+        ).fetchone()[0]
+        if removed:
+            self.conn.execute(
+                "DELETE FROM data_change_log WHERE changed_at < ?",
+                [cutoff],
+            )
+        return int(removed)
+
+    def _index_export_temp_table(self, table: str) -> None:
+        """Give per-symbol COPY scans an ART index instead of a full table scan.
+
+        The export path issues one ``COPY ... WHERE symbol = ...`` per symbol;
+        without an index each scans the whole temp table (up to ~1M rows x 250
+        symbols per batch). If DuckDB refuses to index a temp table, record the
+        degradation and fall back to the original scan-based behaviour (correct,
+        just slower).
+        """
+        try:
+            self.conn.execute(
+                f"CREATE INDEX IF NOT EXISTS _idx_{table}_symbol ON {table}(symbol)"
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("export temp index failed for %s: %s", table, exc)
+            self.export_degradations.append(
+                {"kind": "index", "table": table, "error": str(exc)}
+            )
+
+    def _copy_partitioned_by_symbol(self, query: str, output_dir: Path) -> int:
+        """Write one parquet per symbol with a single DuckDB scan.
+
+        Replaces N ``COPY (... WHERE symbol='...')`` statements that each
+        re-scanned the whole temp table. PARTITION_BY emits
+        ``symbol=<value>/data_0.parquet``; rename those to the PTrade
+        ``<symbol>.parquet`` layout. Raises on failure so callers can fall
+        back to the sequential path.
+        """
+        import shutil
+        import tempfile
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+        staging = Path(tempfile.mkdtemp(prefix="simtrade_parts_", dir=str(output_dir.parent)))
+        written = 0
+        # Large PARTITION_BY writes buffer per-partition rows to preserve
+        # insertion order, which is the main memory/CPU cost here. We already
+        # ORDER BY (symbol, date) explicitly, so the preservation is redundant.
+        prev_order = self.conn.execute(
+            "SELECT current_setting('preserve_insertion_order')"
+        ).fetchone()[0]
+        self.conn.execute("SET preserve_insertion_order=false")
+        try:
+            self.conn.execute(
+                f"COPY ({query}) TO '{staging}' "
+                "(FORMAT PARQUET, PARTITION_BY (symbol), CODEC 'ZSTD')"
+            )
+            for part in staging.iterdir():
+                if not part.is_dir() or not part.name.startswith("symbol="):
+                    continue
+                symbol = part.name[len("symbol="):]
+                files = sorted(part.rglob("*.parquet"))
+                if not files:
+                    continue
+                dest = output_dir / f"{symbol}.parquet"
+                if len(files) == 1:
+                    os.replace(files[0], dest)
+                else:
+                    paths = ", ".join(
+                        "'" + str(p).replace("'", "''") + "'" for p in files
+                    )
+                    self.conn.execute(
+                        f"COPY (SELECT * FROM read_parquet([{paths}]) ORDER BY date) "
+                        f"TO '{dest}' (FORMAT PARQUET, CODEC 'ZSTD')"
+                    )
+                written += 1
+        finally:
+            restore = "true" if str(prev_order).lower() in ("true", "1", "t") else "false"
+            self.conn.execute(f"SET preserve_insertion_order={restore}")
+            shutil.rmtree(staging, ignore_errors=True)
+        return written
+
+    def _copy_partitioned_in_chunks(
+        self, table: str, output_dir: Path, symbols: list[str], chunk_size: int = 200
+    ) -> None:
+        """PARTITION_BY in bounded symbol chunks to stay under DuckDB's memory limit.
+
+        A single COPY over the full wide fundamentals/valuation temp table can
+        exceed the 2.3 GiB default and raise an OOM; chunking keeps one scan
+        per chunk instead of one scan per symbol.
+        """
+        for offset in range(0, len(symbols), chunk_size):
+            chunk = symbols[offset:offset + chunk_size]
+            in_list = ", ".join("'" + s.replace("'", "''") + "'" for s in chunk)
+            self._copy_partitioned_by_symbol(
+                f"SELECT * FROM {table} WHERE symbol IN ({in_list}) "
+                "ORDER BY symbol, date",
+                output_dir,
+            )
+
+    @staticmethod
+    def _partitioned_export_enabled() -> bool:
+        return os.environ.get("SIMTRADE_PARTITIONED_EXPORT", "1") == "1"
+
+    def _try_partitioned_stocks_export(self, output_dir: Path, market: str) -> bool:
+        """One PARTITION_BY write for a CN batch.
+
+        The three per-symbol price-limit branches (ETF / ChiNext-STAR / rest)
+        are expressed as SQL CASE so the whole batch is exported by a single
+        DuckDB scan instead of ~250 filtered COPY statements.
+        """
+        if market == "us" or not self._partitioned_export_enabled():
+            return False
+        excluded = ",".join(f"'{s}'" for s in NON_TRADING_ETF_CODES) or "''"
+        etf = (f"regexp_full_match(f.symbol, '{ETF_SYMBOL_PATTERN}') "
+               f"AND f.symbol NOT IN ({excluded})")
+        chinext = "LEFT(f.symbol, 3) IN ('300','301','688','689')"
+        high = f"""CASE
+            WHEN {etf} THEN raw.high_limit
+            WHEN {chinext} THEN COALESCE(raw.high_limit,
+                CASE WHEN f.date >= '2020-08-24' THEN ROUND(f.preclose * 1.20, 2)
+                     ELSE ROUND(f.preclose * 1.10, 2) END)
+            ELSE COALESCE(raw.high_limit, ROUND(f.preclose * 1.10, 2))
+        END"""
+        low = f"""CASE
+            WHEN {etf} THEN raw.low_limit
+            WHEN {chinext} THEN COALESCE(raw.low_limit,
+                CASE WHEN f.date >= '2020-08-24' THEN ROUND(f.preclose * 0.80, 2)
+                     ELSE ROUND(f.preclose * 0.90, 2) END)
+            ELSE COALESCE(raw.low_limit, ROUND(f.preclose * 0.90, 2))
+        END"""
+        query = f"""SELECT f.symbol AS symbol, f.date, f.open, f.close, f.high, f.low,
+                        {high} AS high_limit, {low} AS low_limit,
+                        f.preclose, f.volume, f.money
+                    FROM _stocks_filled f LEFT JOIN stocks raw USING(symbol, date)
+                    ORDER BY f.symbol, f.date"""
+        try:
+            self._copy_partitioned_by_symbol(query, output_dir)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("partitioned stocks export failed, sequential fallback: %s", exc)
+            self.export_degradations.append(
+                {"kind": "partitioned_export", "table": "stocks", "error": str(exc)}
+            )
+            return False
+
     def _export_fundamentals_batch(self, output_dir: Path, market: str = "cn") -> None:
         """Export all fundamentals with TTM ratios (batch via temp table)."""
         import time
@@ -2465,19 +2784,33 @@ class DuckDBWriter:
             FROM fundamentals f
             {market_filter}
         """)
+        self._index_export_temp_table("_fundamentals_export")
 
         symbols = [r[0] for r in self.conn.execute(
             "SELECT DISTINCT symbol FROM _fundamentals_export ORDER BY symbol"
         ).fetchall()]
 
-        for symbol in symbols:
-            se = symbol.replace("'", "''")
-            self.conn.execute(f"""
-                COPY (
-                    SELECT * EXCLUDE (symbol) FROM _fundamentals_export
-                    WHERE symbol = '{se}' ORDER BY date
-                ) TO '{output_dir / f"{symbol}.parquet"}' (FORMAT PARQUET, CODEC 'ZSTD')
-            """)
+        partitioned = False
+        if self._partitioned_export_enabled():
+            try:
+                self._copy_partitioned_in_chunks(
+                    "_fundamentals_export", output_dir, symbols, chunk_size=200
+                )
+                partitioned = True
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("partitioned fundamentals export failed, sequential fallback: %s", exc)
+                self.export_degradations.append(
+                    {"kind": "partitioned_export", "table": "fundamentals", "error": str(exc)}
+                )
+        if not partitioned:
+            for symbol in symbols:
+                se = symbol.replace("'", "''")
+                self.conn.execute(f"""
+                    COPY (
+                        SELECT * EXCLUDE (symbol) FROM _fundamentals_export
+                        WHERE symbol = '{se}' ORDER BY date
+                    ) TO '{output_dir / f"{symbol}.parquet"}' (FORMAT PARQUET, CODEC 'ZSTD')
+                """)
 
         self.conn.execute("DROP TABLE IF EXISTS _fundamentals_export")
         logger.info(f"Exported {len(symbols)} fundamentals files in {time.time() - t0:.1f}s")
@@ -2520,20 +2853,34 @@ class DuckDBWriter:
                 ) f ON TRUE
                 WHERE v.symbol IN ({symbol_list})
             """)
+            self._index_export_temp_table("_valuation_export_chunk")
 
             export_symbols = [r[0] for r in self.conn.execute(
                 "SELECT DISTINCT symbol FROM _valuation_export_chunk ORDER BY symbol"
             ).fetchall()]
             exported_count += len(export_symbols)
 
-            for symbol in export_symbols:
-                se = symbol.replace("'", "''")
-                self.conn.execute(f"""
-                    COPY (
-                        SELECT * EXCLUDE (symbol) FROM _valuation_export_chunk
-                        WHERE symbol = '{se}' ORDER BY date
-                    ) TO '{output_dir / f"{symbol}.parquet"}' (FORMAT PARQUET, CODEC 'ZSTD')
-                """)
+            partitioned = False
+            if self._partitioned_export_enabled():
+                try:
+                    self._copy_partitioned_in_chunks(
+                        "_valuation_export_chunk", output_dir, export_symbols, chunk_size=100
+                    )
+                    partitioned = True
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("partitioned valuation export failed, sequential fallback: %s", exc)
+                    self.export_degradations.append(
+                        {"kind": "partitioned_export", "table": "valuation", "error": str(exc)}
+                    )
+            if not partitioned:
+                for symbol in export_symbols:
+                    se = symbol.replace("'", "''")
+                    self.conn.execute(f"""
+                        COPY (
+                            SELECT * EXCLUDE (symbol) FROM _valuation_export_chunk
+                            WHERE symbol = '{se}' ORDER BY date
+                        ) TO '{output_dir / f"{symbol}.parquet"}' (FORMAT PARQUET, CODEC 'ZSTD')
+                    """)
 
         self.conn.execute("DROP TABLE IF EXISTS _valuation_export_chunk")
         logger.info(f"Exported {exported_count} valuation files in {time.time() - t0:.1f}s")
@@ -2669,8 +3016,13 @@ class DuckDBWriter:
                 FROM with_lag wl
                 LEFT JOIN adj ON adj.symbol = wl.symbol AND adj.date = wl.date
             """)
-            # Write per-symbol parquet files with price limits
-            if market == "us":
+            self._index_export_temp_table("_stocks_filled")
+            partitioned = self._try_partitioned_stocks_export(output_dir, market)
+
+            # Write per-symbol parquet files with price limits (fallback path)
+            if partitioned:
+                pass
+            elif market == "us":
                 for symbol in batch:
                     se = symbol.replace("'", "''")
                     self.conn.execute(f"""
@@ -2757,10 +3109,13 @@ class DuckDBWriter:
         if market == "cn":
             if not count:
                 raise ValueError("benchmark export missing for CN market")
-            if not benchmark_history_ok(min_date):
+            # min_date already comes from the merged export query above, so
+            # no second scan of stocks/benchmark is needed here.
+            required_floor = effective_benchmark_history_floor()
+            if not benchmark_history_ok(min_date, required_floor):
                 raise ValueError(
                     f"benchmark export truncated: earliest date {min_date}, "
-                    f"required <= {BENCHMARK_HISTORY_FLOOR}"
+                    f"required <= {required_floor}"
                 )
 
         # trade_days.parquet — merge DB trade_days with dates from stocks table

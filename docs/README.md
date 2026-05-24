@@ -13,6 +13,8 @@
 | [ETF申赎清单](ETF_PCF_DATA.md) | 深市历史PCF、沪市最新PCF、字段和日期限制 |
 | [Parquet格式](PTRADE_PARQUET_FORMAT.md) | 输出目录、表结构与字段规范 |
 | [运维与开发](OPERATIONS.md) | CI、来源监控、生产发布、DuckDB恢复与性能复测 |
+| [缺口台账](PARITY_GAPS.md) | 已闭环项、需外部授权源、物理不可能项及验收顺序 |
+| [性能基准](benchmarks/PERFORMANCE.md) | 可复跑的财务导入 A/B 测量与历史观测 |
 
 ## 参考资料与历史记录
 

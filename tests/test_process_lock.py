@@ -43,7 +43,11 @@ def test_windows_lock_backend_without_fcntl(monkeypatch, tmp_path):
 
     def locking(fd, mode, size):
         assert size == 1
-        assert os.lseek(fd, 0, os.SEEK_CUR) == 0
+        # The lock must sit beyond EOF: locking byte 0 would make the PID text
+        # unreadable by other Windows handles (mandatory byte-range lock).
+        # Behavioural contracts below (exclusion, release, file retention)
+        # are unchanged; only the implementation-detail offset moved.
+        assert os.lseek(fd, 0, os.SEEK_CUR) == module._LOCK_REGION_OFFSET
         if mode == 1:
             if held:
                 raise OSError(errno.EACCES, "lock held")

@@ -14,14 +14,15 @@ import duckdb
 
 from simtradedata.config.field_mappings import (
     BENCHMARK_CONFIG,
-    BENCHMARK_HISTORY_FLOOR,
     BLOCKS_COVERAGE_FLOOR,
     CN_HISTORY_START,
     benchmark_history_ok,
+    effective_benchmark_history_floor,
 )
 from simtradedata.utils.paths import DUCKDB_PATH
 
 DB_PATH = str(DUCKDB_PATH)
+_FLOOR_STATS_CACHE: str | None = None
 
 CN_FALLBACK_PREFIXES = {
     "000",
@@ -40,6 +41,16 @@ CN_FALLBACK_PREFIXES = {
 }
 CN_STANDARD_PREFIXES = CN_FALLBACK_PREFIXES
 
+# A-share code prefixes are exchange-specific. The same "000" prefix is a
+# Shenzhen main-board stock on .SZ but an SSE *index* on .SS (000016.SS,
+# 000300.SS, 000905.SS, ...). Applying one flat prefix set to both suffixes
+# pulled ~224 index symbols into the active stock universe: they have neither
+# valuation rows nor industry blocks, so both active_* checks failed.
+CN_EXCHANGE_PREFIXES = {
+    "SS": {"600", "601", "603", "605", "688", "689"},
+    "SZ": {"000", "001", "002", "003", "300", "301", "302"},
+}
+
 # Tables whose rows are part of a CN release and must not contain dates before
 # the deployment history floor.  Audit/change-log tables are intentionally not
 # included: their timestamps describe write history, not released market data.
@@ -53,6 +64,7 @@ _CN_HISTORY_FLOOR_TABLES = (
     ("valuation", False),
     ("fundamentals", False),
     ("benchmark", False),
+    ("index_history", False),
     ("trade_days", False),
     ("money_flow", False),
     ("lhb", False),
@@ -87,7 +99,9 @@ def _is_cn_symbol(symbol: str) -> bool:
     if not isinstance(symbol, str) or "." not in symbol:
         return False
     code, suffix = symbol.split(".", 1)
-    return len(code) == 6 and suffix in {"SZ", "SS"} and code[:3] in CN_FALLBACK_PREFIXES
+    if len(code) != 6 or suffix not in CN_EXCHANGE_PREFIXES:
+        return False
+    return code[:3] in CN_EXCHANGE_PREFIXES[suffix]
 
 
 def _has_standard_cn_prefix(symbol: str) -> bool:
@@ -140,6 +154,15 @@ def _table_columns(conn: duckdb.DuckDBPyConnection, table: str) -> set[str]:
 
 
 def _table_counts(conn: duckdb.DuckDBPyConnection) -> dict[str, int]:
+    """Catalog row counts without a COUNT(*) per table.
+
+    DuckDB maintains ``estimated_size`` for every base table; reading it once
+    from ``duckdb_tables()`` replaces the 20 per-table COUNT(*) scans (stocks,
+    valuation and data_change_log included). Views/external tables have no
+    stored estimate, so only those fall back to an exact COUNT(*). The keys
+    still mirror information_schema.tables, preserving the fail-closed
+    required-table membership check.
+    """
     tables = conn.execute(
         """
         SELECT table_name FROM information_schema.tables
@@ -147,21 +170,58 @@ def _table_counts(conn: duckdb.DuckDBPyConnection) -> dict[str, int]:
         ORDER BY table_name
         """
     ).fetchall()
-    return {
-        name: conn.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0]
-        for (name,) in tables
-    }
+    try:
+        estimates: dict[str, int | None] = dict(
+            conn.execute(
+                """
+                SELECT table_name, estimated_size FROM duckdb_tables()
+                WHERE schema_name='main' AND NOT internal
+                """
+            ).fetchall()
+        )
+    except duckdb.Error:
+        estimates = {}
+
+    counts: dict[str, int] = {}
+    for (name,) in tables:
+        size = estimates.get(name)
+        if size is None:
+            quoted = '"' + name.replace('"', '""') + '"'
+            size = conn.execute(f"SELECT COUNT(*) FROM {quoted}").fetchone()[0]
+        counts[name] = int(size)
+    return counts
+
+
+def _effective_history_floor(history_start: str | None = None) -> str | None:
+    """Canonical configured CN floor, or None for the legacy 2015 package."""
+    candidate = CN_HISTORY_START if history_start is None else history_start
+    if not candidate:
+        return None
+    try:
+        parsed = date.fromisoformat(candidate)
+    except ValueError:
+        return None
+    return parsed.isoformat() if parsed.isoformat() == candidate else None
 
 
 def _cn_history_floor_date() -> date | None:
     """Parsed CN_HISTORY_START when set and canonical, else None."""
-    if not CN_HISTORY_START:
-        return None
-    try:
-        floor = date.fromisoformat(CN_HISTORY_START)
-    except ValueError:
-        return None
-    return floor if floor.isoformat() == CN_HISTORY_START else None
+    floor = _effective_history_floor()
+    return date.fromisoformat(floor) if floor else None
+
+
+def _benchmark_floor() -> str:
+    """Benchmark coverage floor required by the active history configuration."""
+    return effective_benchmark_history_floor(_effective_history_floor())
+
+
+def _floor_date_expr(compact: bool) -> str:
+    """Parsed date expression shared by the DB-side and export-side floor checks."""
+    return (
+        "TRY_STRPTIME(CAST(date AS VARCHAR), '%Y%m%d')"
+        if compact
+        else "TRY_CAST(date AS DATE)"
+    )
 
 
 def _history_floor_stats(
@@ -170,12 +230,8 @@ def _history_floor_stats(
     compact: bool,
     params: list[Any],
 ) -> tuple[Any, int, int]:
-    """(min date, invalid rows, rows before CN_HISTORY_START) for one table or parquet glob."""
-    parsed = (
-        "TRY_STRPTIME(CAST(date AS VARCHAR), '%Y%m%d')"
-        if compact
-        else "TRY_CAST(date AS DATE)"
-    )
+    """Exact (min date, invalid rows, rows before CN_HISTORY_START) for one table/glob."""
+    parsed = _floor_date_expr(compact)
     sql = f"""
         SELECT
             MIN({parsed}),
@@ -193,14 +249,50 @@ def _history_floor_stats(
     return row[0], int(row[1]), int(row[2])
 
 
+def _add_floor_check(
+    checks: list[dict[str, Any]],
+    name: str,
+    min_date: Any,
+    invalid_count: int,
+    before_count: int,
+    floor: str,
+) -> None:
+    """Fail closed on released rows before the configured floor.
+
+    A pass proves only that no released row predates ``floor`` and no date is
+    unparsable; it does NOT prove that the table covers history back to the
+    floor. ``coverage_to_floor`` records that separate question explicitly, so
+    source-limited domains (benchmark/valuation/fundamentals) cannot be read as
+    full-history coverage in a gate report.
+    """
+    actual = _date_text(min_date)
+    _add_check(
+        checks,
+        name,
+        invalid_count == 0 and before_count == 0,
+        actual=actual,
+        expected=f"no released row before {floor}; no invalid dates",
+        coverage_to_floor=bool(actual and actual <= floor),
+        invalid_count=invalid_count,
+        before_count=before_count,
+    )
+
+
 def _check_cn_history_floor(
     conn: duckdb.DuckDBPyConnection,
     checks: list[dict[str, Any]],
 ) -> None:
-    """Fail closed when any released CN data table predates the configured floor."""
+    """Validate the configured floor and reject released rows before it.
+
+    All nine tables are aggregated in a single UNION ALL query with conditional
+    counts per table instead of nine separate full-table scans / round trips.
+    Each branch still scans its own table exactly once and returns a row even
+    when the table is empty, so every check name and verdict is preserved.
+    """
     if not CN_HISTORY_START:
         return
-    if _cn_history_floor_date() is None:
+    floor = _effective_history_floor()
+    if floor is None:
         _add_check(
             checks,
             "cn_history_floor_config",
@@ -210,20 +302,49 @@ def _check_cn_history_floor(
         )
         return
 
-    for table, compact in _CN_HISTORY_FLOOR_TABLES:
-        if not _table_exists(conn, table):
-            continue
-        min_date, invalid_count, before_count = _history_floor_stats(
-            conn, table, compact, [CN_HISTORY_START]
+    existing = {
+        row[0]
+        for row in conn.execute(
+            "SELECT table_name FROM information_schema.tables WHERE table_schema='main'"
+        ).fetchall()
+    }
+    selected = [
+        (table, compact)
+        for table, compact in _CN_HISTORY_FLOOR_TABLES
+        if table in existing
+    ]
+    if not selected:
+        return
+
+    branches = []
+    for table, compact in selected:
+        parsed = _floor_date_expr(compact)
+        branches.append(
+            f"""
+            SELECT '{table}' AS table_name,
+                   MIN({parsed}) AS min_date,
+                   COUNT(*) FILTER (
+                       WHERE date IS NOT NULL AND {parsed} IS NULL
+                   ) AS invalid_count,
+                   COUNT(*) FILTER (WHERE {parsed} < ?::DATE) AS before_count
+            FROM {table}
+            """
         )
-        _add_check(
+    stats = {
+        row[0]: (row[1], int(row[2]), int(row[3]))
+        for row in conn.execute(
+            " UNION ALL ".join(branches), [floor] * len(branches)
+        ).fetchall()
+    }
+    for table, _ in selected:
+        min_date, invalid_count, before_count = stats.get(table, (None, 0, 0))
+        _add_floor_check(
             checks,
             f"{table}_history_floor",
-            invalid_count == 0 and before_count == 0,
-            actual=_date_text(min_date),
-            expected=f">= {CN_HISTORY_START}",
-            invalid_count=invalid_count,
-            before_count=before_count,
+            min_date,
+            invalid_count,
+            before_count,
+            floor,
         )
 
 
@@ -475,6 +596,181 @@ def _add_check(
     )
 
 
+# Fixed-width physical Parquet types: their rowgroup min/max stats are exact.
+# BYTE_ARRAY (e.g. the compact 'YYYYMMDD' stock_status dates) is deliberately
+# excluded: string stats cannot prove that every value parses, so it keeps the
+# fail-closed value-level scan.
+_EXACT_DATE_PARQUET_TYPES = frozenset({"INT32", "INT64"})
+
+
+def _parquet_date_metadata(
+    paths: list[str], cache_path: str | None = None
+) -> dict[str, Any] | None:
+    """Footer-only date statistics, with a stat-validated on-disk cache.
+
+    Reading ~18k Parquet footers on Windows costs ~260s of small random IO.
+    Cache each file's footer stats keyed by (size, mtime_ns): unchanged files
+    only need an os.stat, while changed/new files get a real footer read. Any
+    stat mismatch forces a re-read, so a stale cache can never weaken the
+    floor gate.
+    """
+    import os
+
+    if not paths:
+        return {"rows": {}, "stats": {}}
+    cache_file = Path(cache_path) if cache_path else None
+    cache: dict[str, Any] = {}
+    if cache_file and cache_file.is_file():
+        try:
+            cache = json.loads(cache_file.read_text(encoding="utf-8")).get("files", {})
+        except Exception:  # noqa: BLE001
+            cache = {}
+
+    def fingerprint(path: str) -> tuple[int, int]:
+        st = os.stat(path)
+        return st.st_size, st.st_mtime_ns
+
+    file_rows: dict[str, int] = {}
+    stats: dict[str, list[tuple[Any, ...]]] = {}
+    missing: list[str] = []
+    for path in paths:
+        try:
+            size, mtime = fingerprint(path)
+        except OSError:
+            missing.append(path)
+            continue
+        rec = cache.get(path)
+        if rec and rec.get("size") == size and rec.get("mtime_ns") == mtime:
+            file_rows[path] = int(rec.get("num_rows") or 0)
+            stats[path] = [
+                (rg[0], rg[1], rg[2], rg[3],
+                 date.fromisoformat(rg[4]) if rg[4] else None, None)
+                for rg in rec.get("rowgroups", [])
+            ]
+        else:
+            missing.append(path)
+
+    if missing:
+        try:
+            fresh_rows = {
+                row[0]: int(row[1] or 0)
+                for row in duckdb.sql(
+                    "SELECT file_name, num_rows FROM parquet_file_metadata(?)",
+                    params=[missing],
+                ).fetchall()
+            }
+            fresh_stats: dict[str, list[tuple[Any, ...]]] = {}
+            for row in duckdb.sql(
+                """
+                SELECT file_name, type, stats_min_value, stats_null_count,
+                       num_values,
+                       TRY_CAST(stats_min_value AS DATE) AS parsed_date,
+                       TRY_STRPTIME(CAST(stats_min_value AS VARCHAR), '%Y%m%d')
+                           AS parsed_compact
+                FROM parquet_metadata(?)
+                WHERE path_in_schema = 'date'
+                """,
+                params=[missing],
+            ).fetchall():
+                fresh_stats.setdefault(row[0], []).append(row[1:])
+        except duckdb.Error:
+            # Legacy/unreadable footers: fall back to the exact value-level scan.
+            return None
+        file_rows.update(fresh_rows)
+        stats.update(fresh_stats)
+        for path in missing:
+            try:
+                size, mtime = fingerprint(path)
+            except OSError:
+                continue
+            rowgroups = []
+            for rg in stats.get(path, []):
+                parsed = rg[4]
+                min_value = rg[1]
+                if isinstance(min_value, (datetime, date)):
+                    min_value = min_value.isoformat()
+                rowgroups.append([
+                    rg[0], min_value, rg[2], rg[3],
+                    parsed.isoformat() if isinstance(parsed, date) else None,
+                ])
+            cache[path] = {
+                "size": size, "mtime_ns": mtime,
+                "num_rows": file_rows.get(path, 0),
+                "rowgroups": rowgroups,
+            }
+
+    if cache_file:
+        try:
+            cache_file.parent.mkdir(parents=True, exist_ok=True)
+            tmp = cache_file.with_name(cache_file.name + ".tmp")
+            tmp.write_text(json.dumps({"files": cache}), encoding="utf-8")
+            tmp.replace(cache_file)
+        except Exception:  # noqa: BLE001
+            pass
+    return {"rows": file_rows, "stats": stats}
+
+
+def _export_floor_from_metadata(
+    paths: list[str],
+    compact: bool,
+    floor: str,
+    metadata: dict[str, Any] | None,
+) -> tuple[Any, int, int] | None:
+    """Prove a clean floor from rowgroup stats, or ask for the exact scan.
+
+    Only returns ``(min_date, 0, 0)`` when every date value is provably at or
+    after the floor. Missing/inexact stats, string date columns and detected
+    violations return None so the caller rechecks with the original query and
+    reports exact invalid/before counts (never a weaker verdict).
+    """
+    if metadata is None:
+        return None
+    floor_date = date.fromisoformat(floor)
+    file_rows = metadata["rows"]
+    stats = metadata["stats"]
+    min_date = None
+    for path in paths:
+        rows = file_rows.get(path)
+        if rows is None:
+            return None
+        if rows == 0:
+            continue  # empty file: MIN(date) is NULL, no invalid/before rows
+        rowgroups = stats.get(path)
+        if not rowgroups:
+            return None
+        for physical_type, min_value, null_count, num_values, parsed_date, _ in rowgroups:
+            if compact or physical_type not in _EXACT_DATE_PARQUET_TYPES:
+                return None
+            if min_value is None:
+                if (
+                    null_count is not None
+                    and num_values is not None
+                    and int(null_count) >= int(num_values)
+                ):
+                    continue  # all-NULL rowgroup: MIN(date) is NULL, no violations
+                return None
+            if parsed_date is None or parsed_date < floor_date:
+                return None
+            if min_date is None or parsed_date < min_date:
+                min_date = parsed_date
+    return min_date, 0, 0
+
+
+def _benchmark_export_min_date(path: str, metadata: dict[str, Any] | None) -> Any:
+    """MIN(date)::VARCHAR from footer stats, falling back to the exact query."""
+    if metadata is not None:
+        rowgroups = metadata["stats"].get(path, [])
+        if rowgroups and all(
+            row[0] in _EXACT_DATE_PARQUET_TYPES and row[1] is not None
+            for row in rowgroups
+        ):
+            return min(row[1] for row in rowgroups)
+    return duckdb.sql(
+        "SELECT MIN(date)::VARCHAR FROM read_parquet(?)",
+        params=[path],
+    ).fetchone()[0]
+
+
 def _inspect_export(
     export_dir: Path,
     market: str,
@@ -552,26 +848,21 @@ def _inspect_export(
 
     if market == "cn":
         benchmark_file = export_dir / "metadata" / "benchmark.parquet"
+        benchmark_path = str(benchmark_file)
         _add_check(
             checks,
             "benchmark_export_present",
             benchmark_file.exists(),
-            path=str(benchmark_file),
+            path=benchmark_path,
         )
-        if benchmark_file.exists():
-            min_date = duckdb.sql(
-                "SELECT MIN(date)::VARCHAR FROM read_parquet(?)",
-                params=[str(benchmark_file)],
-            ).fetchone()[0]
-            _add_check(
-                checks,
-                "benchmark_export_history_coverage",
-                benchmark_history_ok(min_date),
-                actual=min_date,
-                expected=f"<= {BENCHMARK_HISTORY_FLOOR}",
-            )
 
-        if _cn_history_floor_date() is not None:
+        floor = (
+            _effective_history_floor()
+            if _cn_history_floor_date() is not None
+            else None
+        )
+        floor_groups: list[tuple[str, bool, list[str]]] = []
+        if floor is not None:
             for table, compact in _CN_HISTORY_FLOOR_TABLES:
                 path_text = _CN_EXPORT_FLOOR_PATHS.get(table)
                 if path_text is None:
@@ -582,19 +873,49 @@ def _inspect_export(
                     if path.is_dir()
                     else ([str(path)] if path.exists() else [])
                 )
-                if not paths:
-                    continue
-                min_date, invalid_count, before_count = _history_floor_stats(
-                    None, "read_parquet(?)", compact, [CN_HISTORY_START, paths]
+                if paths:
+                    floor_groups.append((table, compact, paths))
+
+        # A single footer-only read is shared by the benchmark coverage check
+        # and all export floor checks; the DB-side floor check already covers
+        # the source tables with its own combined UNION ALL query.
+        metadata_paths = [benchmark_path] if benchmark_file.exists() else []
+        for _, _, paths in floor_groups:
+            metadata_paths.extend(paths)
+        metadata = _parquet_date_metadata(
+            sorted(set(metadata_paths)), _FLOOR_STATS_CACHE
+        )
+
+        if benchmark_file.exists():
+            min_date = _benchmark_export_min_date(benchmark_path, metadata)
+            _add_check(
+                checks,
+                "benchmark_export_history_coverage",
+                benchmark_history_ok(min_date, _benchmark_floor()),
+                actual=min_date,
+                expected=f"<= {_benchmark_floor()}",
+            )
+
+        if floor is not None:
+            for table, compact, paths in floor_groups:
+                proven = _export_floor_from_metadata(
+                    paths, compact, floor, metadata
                 )
-                _add_check(
+                if proven is None:
+                    # Exact value-level check only when footer stats cannot
+                    # prove cleanliness (compact text dates, missing stats,
+                    # or a detected violation needing exact counts).
+                    proven = _history_floor_stats(
+                        None, "read_parquet(?)", compact, [floor, paths]
+                    )
+                min_date, invalid_count, before_count = proven
+                _add_floor_check(
                     checks,
                     f"{table}_export_history_floor",
-                    invalid_count == 0 and before_count == 0,
-                    actual=_date_text(min_date),
-                    expected=f">= {CN_HISTORY_START}",
-                    invalid_count=invalid_count,
-                    before_count=before_count,
+                    min_date,
+                    invalid_count,
+                    before_count,
+                    floor,
                 )
 
     fundamentals_dir = export_dir / "fundamentals"
@@ -770,9 +1091,9 @@ def check_integrity(
             _add_check(
                 checks,
                 "benchmark_history_coverage",
-                benchmark_history_ok(benchmark_start_text),
+                benchmark_history_ok(benchmark_start_text, _benchmark_floor()),
                 actual=benchmark_start_text,
-                expected=f"<= {BENCHMARK_HISTORY_FLOOR}",
+                expected=f"<= {_benchmark_floor()}",
             )
 
             # Industry blocks coverage over the active universe (fail closed
@@ -942,6 +1263,16 @@ def main() -> int:
         help="Exit non-zero when required completeness checks fail",
     )
     parser.add_argument(
+        "--history-start",
+        default=None,
+        help="Override SIMTRADE_CN_HISTORY_START for full-history floor checks",
+    )
+    parser.add_argument(
+        "--floor-stats",
+        default=None,
+        help="Path to a stat-validated parquet footer cache (speeds up floor checks)",
+    )
+    parser.add_argument(
         "--max-examples",
         type=int,
         default=20,
@@ -953,10 +1284,18 @@ def main() -> int:
         help="Deprecated. Integrity checks no longer start downloads.",
     )
     args = parser.parse_args()
+    globals()["_FLOOR_STATS_CACHE"] = args.floor_stats
 
     if args.fix:
         print("--fix is disabled; use a targeted remediation command instead.")
         return 2
+
+    if args.history_start:
+        floor = _effective_history_floor(args.history_start)
+        if floor is None:
+            print("--history-start must be canonical YYYY-MM-DD")
+            return 2
+        globals()["CN_HISTORY_START"] = floor
 
     report = check_integrity(
         db_path=args.db_path,

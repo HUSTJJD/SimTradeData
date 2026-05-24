@@ -17,13 +17,21 @@ import pandas as pd
 from simtradedata.router import SmartRouter
 
 SOURCES = {
+    "public": ("cn", "600000.SS"),
     "mootdx": ("cn", "600000.SS"),
     "eastmoney": ("cn", "600000.SS"),
     "baostock": ("cn", "600000.SS"),
     "yfinance": ("us", "AAPL.US"),
     "tdx_package": ("cn", "600000.SS"),
 }
-DEFAULT_SOURCES = ["mootdx", "eastmoney", "baostock", "yfinance", "tdx_package"]
+# Keep every upstream SmartRouter source in the daily health probe and add the
+# new first-party primary; no source is silently retired from monitoring.
+# QMT local DAT bars are intentionally NOT here: they are not a SmartRouter
+# source and are cross-checked by unified_data_manager.py instead (optional
+# local fallback, freshness never caps the target date).
+DEFAULT_SOURCES = [
+    "public", "mootdx", "eastmoney", "baostock", "yfinance", "tdx_package",
+]
 CALENDARS = {"cn": "XSHG", "us": "XNYS"}
 # Allow CN end-of-day processing and US daily-bar publication to finish.
 UPDATE_GRACE_HOURS = {"cn": 6, "us": 2}
@@ -139,8 +147,12 @@ def probe(source: str, expected: str | None, end: str) -> dict:
         with SmartRouter(config={"daily_bars": {market: [source]}}) as router:
             df = router.get_daily_bars(symbol, start, end)
             today = (pd.Timestamp(end) - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-            # Yahoo uses a date index and does not expose actual traded amount.
-            result = validate_bars(df, expected, today, require_amount=source != "yfinance")
+            # Yahoo uses a date index; the Tencent `public` adapter drops the
+            # amount column when the upstream feed returns no turnover.
+            result = validate_bars(
+                df, expected, today,
+                require_amount=source not in ("yfinance", "public"),
+            )
             if source == "mootdx" and result["status"] == "ok":
                 samples = []
                 for etf in ["510300.SS", "159915.SZ"]:

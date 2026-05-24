@@ -7,7 +7,6 @@ much more efficient than BaoStock's per-stock API approach.
 """
 
 import logging
-import tempfile
 from pathlib import Path
 from typing import List, Optional
 
@@ -38,15 +37,19 @@ class MootdxAffairFetcher:
         Initialize MootdxAffairFetcher.
 
         Args:
-            download_dir: Directory for downloading ZIP files.
-                         Defaults to system temp directory.
+            download_dir: Directory for downloading ZIP files. Defaults to a
+                persistent directory beside the canonical DB.
         """
         if download_dir:
             self._download_dir = Path(download_dir)
-            self._download_dir.mkdir(parents=True, exist_ok=True)
         else:
-            self._download_dir = Path(tempfile.gettempdir()) / "mootdx_affair"
-            self._download_dir.mkdir(parents=True, exist_ok=True)
+            # Keep the 144 quarter packages (261MB) next to the database.
+            # The legacy %TEMP% location is reclaimed by Windows, which forced
+            # a full re-download; the export gate also reads this directory.
+            self._download_dir = (
+                Path(__file__).resolve().parents[2] / "data" / "mootdx_financial"
+            )
+        self._download_dir.mkdir(parents=True, exist_ok=True)
 
     def list_available_reports(self) -> List[dict]:
         """

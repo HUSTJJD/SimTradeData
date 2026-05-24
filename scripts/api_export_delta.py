@@ -44,24 +44,40 @@ def _latest_stock_date(conn: duckdb.DuckDBPyConnection) -> dt.date:
     return value
 
 
-def _count_symbols_on_date(
+def _count_required_symbols_by_date(
     conn: duckdb.DuckDBPyConnection,
     *,
     table: str,
+    dates: list[dt.date],
     symbols: list[str],
-    date_value: dt.date,
-) -> int:
-    if not symbols:
-        return 0
-    placeholders = ",".join(["?"] * len(symbols))
-    return conn.execute(
+) -> dict[dt.date, int]:
+    """One grouped query for all candidate dates, instead of one scan per date.
+
+    ``dates``/``symbols`` are parallel lists of the exact required
+    (date, symbol) pairs from the active/halted universe. Joining against them
+    preserves the fail-closed rule (COUNT(DISTINCT symbol) must equal the number
+    of required symbols); the Python side then compares the per-date counts.
+    """
+    if not dates:
+        return {}
+    rows = conn.execute(
         f"""
-        SELECT COUNT(DISTINCT symbol)
-        FROM {table}
-        WHERE date = ? AND symbol IN ({placeholders})
+        WITH required AS (
+            SELECT unnest(?::DATE[]) AS date, unnest(?::VARCHAR[]) AS symbol
+        )
+        SELECT s.date, COUNT(DISTINCT s.symbol) AS symbol_count
+        FROM {table} s
+        JOIN required r
+          ON r.date = s.date AND r.symbol = s.symbol
+        WHERE s.date IN (SELECT DISTINCT date FROM required)
+        GROUP BY s.date
         """,
-        [date_value, *symbols],
-    ).fetchone()[0]
+        [dates, symbols],
+    ).fetchall()
+    return {
+        (value.date() if isinstance(value, dt.datetime) else value): int(count)
+        for value, count in rows
+    }
 
 
 def _latest_complete_date(conn: duckdb.DuckDBPyConnection, market: str) -> dt.date | None:
@@ -78,9 +94,17 @@ def _latest_complete_date(conn: duckdb.DuckDBPyConnection, market: str) -> dt.da
         LIMIT 60
         """
     ).fetchall()
+    candidates = [
+        value.date() if isinstance(value, dt.datetime) else value
+        for (value,) in recent_dates
+    ]
 
-    for (candidate,) in recent_dates:
-        candidate_date = candidate.date() if isinstance(candidate, dt.datetime) else candidate
+    # Resolve the active/halted universe once per candidate (small metadata
+    # tables), then batch the two big COUNT(DISTINCT symbol) checks into one
+    # grouped query per table instead of two full scans per candidate round.
+    required_by_date: dict[dt.date, list[str]] = {}
+    empty_universe_date: dt.date | None = None
+    for candidate_date in candidates:
         candidate_text = candidate_date.isoformat()
         active_symbols, _ = _stock_universe(conn, market, candidate_text)
         halted_symbols = _halted_symbols_on(conn, candidate_text)
@@ -88,28 +112,34 @@ def _latest_complete_date(conn: duckdb.DuckDBPyConnection, market: str) -> dt.da
             symbol for symbol in active_symbols if symbol not in halted_symbols
         ]
         if not required_symbols:
-            return candidate_date
+            empty_universe_date = candidate_date
+            break
+        required_by_date[candidate_date] = required_symbols
 
+    if not required_by_date:
+        return empty_universe_date
+
+    pair_dates: list[dt.date] = []
+    pair_symbols: list[str] = []
+    for candidate_date, required_symbols in required_by_date.items():
+        pair_dates.extend([candidate_date] * len(required_symbols))
+        pair_symbols.extend(required_symbols)
+
+    stocks_counts = _count_required_symbols_by_date(
+        conn, table="stocks", dates=pair_dates, symbols=pair_symbols
+    )
+    valuation_counts = _count_required_symbols_by_date(
+        conn, table="valuation", dates=pair_dates, symbols=pair_symbols
+    )
+    for candidate_date, required_symbols in required_by_date.items():
         expected = len(required_symbols)
         if (
-            _count_symbols_on_date(
-                conn,
-                table="stocks",
-                symbols=required_symbols,
-                date_value=candidate_date,
-            )
-            == expected
-            and _count_symbols_on_date(
-                conn,
-                table="valuation",
-                symbols=required_symbols,
-                date_value=candidate_date,
-            )
-            == expected
+            stocks_counts.get(candidate_date, 0) == expected
+            and valuation_counts.get(candidate_date, 0) == expected
         ):
             return candidate_date
 
-    return None
+    return empty_universe_date
 
 
 def _copy_table(
@@ -120,14 +150,19 @@ def _copy_table(
     output_dir: Path,
 ) -> dict:
     output = output_dir / f"{table}.parquet"
-    rows = conn.execute(f"SELECT COUNT(*) FROM ({sql})").fetchone()[0]
     conn.execute(
         f"COPY ({sql}) TO '{_sql_path(output)}' (FORMAT PARQUET, CODEC 'ZSTD')"
     )
+    # The Parquet footer records the exact row count COPY just wrote; reading
+    # it avoids executing the export query a second time for COUNT(*).
+    rows = conn.execute(
+        "SELECT COALESCE(SUM(num_rows), 0) FROM parquet_file_metadata(?)",
+        [str(output)],
+    ).fetchone()[0]
     return {
         "table": table,
         "path": output.name,
-        "rows": rows,
+        "rows": int(rows),
         "size": output.stat().st_size,
         "sha256": _sha256(output),
     }
@@ -188,7 +223,15 @@ def export_api_delta(
         conn = duckdb.connect(str(db_path), read_only=True)
     except duckdb.IOException as exc:
         message = str(exc)
-        if "Could not set lock" not in message and "Conflicting lock" not in message:
+        # DuckDB 1.5.6 on Windows reports a busy file as "File is already open
+        # in <pid>" rather than the older lock-phrasing; the localized Chinese
+        # prefix varies with the OS code page, so match the stable English tail.
+        busy_markers = (
+            "Could not set lock",
+            "Conflicting lock",
+            "File is already open in",
+        )
+        if not any(marker in message for marker in busy_markers):
             raise
         _write_busy_manifest_archive(
             output,
@@ -227,6 +270,29 @@ def export_api_delta(
 
             if last_sync >= latest:
                 _write_manifest(package_dir / "manifest.json", base_manifest)
+                _write_archive(output, package_dir, ["manifest.json"])
+                return
+
+            # A full-history rebuild clears the change log and establishes a
+            # new baseline. Clients older than that baseline cannot be served
+            # an incremental delta, so redirect them to the baseline package.
+            baseline = None
+            try:
+                row = conn.execute(
+                    "SELECT value FROM version_info WHERE key='baseline_version'"
+                ).fetchone()
+                if row and row[0]:
+                    baseline = dt.date.fromisoformat(str(row[0]))
+            except Exception:  # noqa: BLE001
+                baseline = None
+            if baseline and last_sync < baseline:
+                manifest = {
+                    **base_manifest,
+                    "fallback_to_baseline": True,
+                    "reason": "baseline_required",
+                    "baseline_version": baseline.isoformat(),
+                }
+                _write_manifest(package_dir / "manifest.json", manifest)
                 _write_archive(output, package_dir, ["manifest.json"])
                 return
 

@@ -23,11 +23,12 @@ from scripts.download_tdx_day import (
     download_file,
     needs_update,
     get_remote_file_info,
+    read_package_meta,
 )
 from scripts.import_tdx_day import TdxDayImporter, import_benchmark_indices
 from simtradedata.config.field_mappings import (
-    BENCHMARK_HISTORY_FLOOR,
     benchmark_history_ok,
+    effective_benchmark_history_floor,
 )
 from simtradedata.utils.process_lock import ProcessLock
 from simtradedata.writers.duckdb_writer import DEFAULT_DB_PATH
@@ -57,7 +58,8 @@ def main() -> int:
     with ProcessLock(LOCK_FILE):
         # needs_update returns True when the file is missing or stale
         if not args.skip_download and needs_update(
-            zip_path, get_remote_file_info(DOWNLOAD_URL)
+            zip_path,
+            get_remote_file_info(DOWNLOAD_URL, local_meta=read_package_meta(zip_path)),
         ):
             print(f"Downloading {DOWNLOAD_URL} (~500MB)...")
             if not download_file(DOWNLOAD_URL, zip_path):
@@ -83,11 +85,12 @@ def main() -> int:
         finally:
             importer.close()
         print(f"benchmark table: {min_date} -> {max_date} ({rows} rows)")
-        if not benchmark_history_ok(min_date):
+        required_floor = effective_benchmark_history_floor()
+        if not benchmark_history_ok(min_date, required_floor):
             logger.error(
                 "benchmark still truncated: %s (required <= %s)",
                 min_date,
-                BENCHMARK_HISTORY_FLOOR,
+                required_floor,
             )
             return 1
 

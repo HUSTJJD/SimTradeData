@@ -6,6 +6,7 @@ Supports: BaoStock, mootdx
 """
 
 import os
+from datetime import date
 
 # BaoStock -> PTrade field mappings
 
@@ -107,16 +108,32 @@ BENCHMARK_CONFIG = {
     }
 }
 
-# Benchmark history floor for CN exports: the exported benchmark must cover
-# dates back to at least this value. TDX index bars are depth-limited, so a
-# truncated export fails the gate instead of shipping silently.
-# Value matches the documented package contract:
-# docs/PTRADE_PARQUET_FORMAT.md (version.parquet start_date = 2015-01-01)
-BENCHMARK_HISTORY_FLOOR = '2015-01-01'
+# Earliest date each configured benchmark index can physically supply, measured
+# from the TDX full-history index bars. A CN history floor earlier than the
+# default index's inception is unachievable: no source can produce index bars
+# from before the index existed. Gates clamp the required floor to this value
+# instead of failing an impossible requirement.
+BENCHMARK_INDEX_INCEPTION = {
+    '000300.SS': '2005-01-04',  # CSI300 (default)
+    '000016.SS': '2004-01-02',  # SSE50
+    '000905.SS': '2005-01-04',  # CSI500
+    '000001.SS': '1990-12-19',  # SSE Composite
+    '399001.SZ': '1991-04-03',  # SZSE Component
+    '399006.SZ': '2010-06-01',  # ChiNext
+}
 
-# Optional per-deployment CN daily history trim: rows before this date are
-# dropped at TDX import time. Opt-in via SIMTRADE_CN_HISTORY_START (YYYY-MM-DD);
-# unset = full history is imported.
+# Default benchmark history floor for CN exports. The exported benchmark must
+# cover dates back to at least this value for the canonical 2015-era package.
+# A deployment-wide floor set through SIMTRADE_CN_HISTORY_START replaces this
+# default through effective_benchmark_history_floor(); use that helper rather
+# than importing the constant directly in gates/exporters.
+DEFAULT_BENCHMARK_HISTORY_FLOOR = '2015-01-05'
+BENCHMARK_HISTORY_FLOOR = DEFAULT_BENCHMARK_HISTORY_FLOOR
+
+# Optional per-deployment CN history floor / trim. When set to a canonical
+# YYYY-MM-DD value it controls both the full-history rebuild start and the
+# strict release floor. Unset keeps the legacy 2015 floor for checks and lets
+# TDX import retain its full source history.
 CN_HISTORY_START = os.environ.get("SIMTRADE_CN_HISTORY_START") or None
 
 # Minimum share of CN stock_metadata rows that must carry industry blocks,
@@ -124,6 +141,31 @@ CN_HISTORY_START = os.environ.get("SIMTRADE_CN_HISTORY_START") or None
 BLOCKS_COVERAGE_FLOOR = 0.95
 
 
-def benchmark_history_ok(start_text: str | None) -> bool:
-    """True when the earliest benchmark date covers BENCHMARK_HISTORY_FLOOR."""
-    return bool(start_text) and start_text <= BENCHMARK_HISTORY_FLOOR
+def effective_benchmark_history_floor(history_start: str | None = None) -> str:
+    """Return the benchmark floor required by the active CN history start.
+
+    A full-history rebuild may set a floor far earlier than the benchmark index
+    existed (e.g. 1990-12-19 with CSI300, which starts 2005-01-04). Clamping to
+    the index inception keeps the gate strict about truncated exports without
+    demanding history that no data source can provide. Deployments using a
+    long-lived index such as 000001.SS keep the configured floor unchanged.
+    """
+    candidate = CN_HISTORY_START if history_start is None else history_start
+    required = DEFAULT_BENCHMARK_HISTORY_FLOOR
+    if candidate:
+        try:
+            parsed = date.fromisoformat(candidate)
+            if parsed.isoformat() == candidate:
+                required = candidate
+        except (TypeError, ValueError):
+            pass
+    inception = BENCHMARK_INDEX_INCEPTION.get(
+        BENCHMARK_CONFIG["default_index"], DEFAULT_BENCHMARK_HISTORY_FLOOR
+    )
+    return max(required, inception)
+
+
+def benchmark_history_ok(start_text: str | None, floor: str | None = None) -> bool:
+    """True when the earliest benchmark date covers the effective floor."""
+    required = floor or effective_benchmark_history_floor()
+    return bool(start_text) and str(start_text)[:10] <= required

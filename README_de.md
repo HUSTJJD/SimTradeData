@@ -37,6 +37,36 @@ uv run python scripts/export_parquet.py
 
 Standardexport: `data/export/cn/`. Weboberfläche und CLI nicht gleichzeitig in dieselbe Datenbank schreiben lassen.
 
+## Vollständige Historie und Datenpflege
+
+Seit 2026-11 reicht der kanonische CN-Tageskursbestand bis zum **19.12.1990**
+zurück (Beginn des A-Aktienmarkts); Handelskalender, Ex-Rechte und das Manifest
+des Datenpakets verwenden denselben Startwert. Die vollständige Rekonstruktion
+läuft über `unified_data_manager.py --apply --full-history --history-start
+1990-12-19`; der normale inkrementelle Lauf bleibt bei 24 Monaten und ergänzt
+keine 1990er Jahre.
+
+**Grenzen der 1990er Jahre**: Finanzdaten aus den 1990ern sind nur sehr dünn
+vorhanden, Bewertungen beginnen 1992, der Standard-Benchmark CSI 300 erst 2005,
+ETFs und Indexzusammensetzungen existierten damals noch nicht.
+`scripts/build_index_history.py --apply` veröffentlicht deshalb die bereits
+vorhandenen langen Indexreihen (Shanghai Composite ab 1990, SZSE Component ab
+1991) als zusätzliches Asset `metadata/index_history.parquet`, ohne den
+Standard-Benchmark zu ändern oder Kurse vor Indexgründung zu erfinden.
+
+`unified_data_manager.py` prüft vor der Veröffentlichung die Datenqualität,
+gleicht optional lokale QMT-DAT-Dateien ab (0,5 %-Toleranz; systematische
+Konflikte werden protokolliert und übersprungen), exportiert stufenweise und
+führt danach die strenge Integritätsprüfung sowie einen PTrade-Speicher-
+Smoke-Test aus. Ohne `--apply` ist alles ein schreibgeschützter Probelauf.
+QMT ist optional und begrenzt niemals das Zieldatum; Internetquellen haben
+Vorrang.
+
+`data_health_report.py` erzeugt einen schreibgeschützten Bericht über
+Abdeckung, Zeiträume und auffällige Zeilen. Ein `pass` der Veröffentlichungs-
+schranke bedeutet nicht, dass alle Warnungen behoben sind: Warnungen erfordern
+eine Quellaktualisierung oder Quarantäne, niemals erfundene Werte.
+
 ## Dokumentation und Grenzen
 
 | Thema | Anleitung |

@@ -16,19 +16,27 @@ class TestRouteConfig:
                     )
 
     def test_daily_bars_cn_has_fallback(self):
-        sources = DEFAULT_ROUTE_TABLE["daily_bars"]["cn"]
-        assert len(sources) >= 2, "daily_bars/cn should have fallback sources"
-        assert sources == ["mootdx", "eastmoney", "baostock"]
+        # Exact list: adding or dropping a source must be an explicit decision.
+        assert DEFAULT_ROUTE_TABLE["daily_bars"]["cn"] == [
+            "public", "eastmoney", "baostock",
+            "akshare", "adata", "efinance", "mootdx",
+        ]
 
-    def test_mootdx_keeps_non_daily_interfaces(self):
-        for data_type in [
-            "xdxr",
-            "fundamentals",
-            "stock_list",
-            "realtime_quotes",
-            "minute_bars",
-        ]:
+    def test_upstream_mootdx_sources_are_preserved(self):
+        """上游 TDX/mootdx 不得被新增源挤出：既是日线最后兜底，
+        也是非日线接口的首源。"""
+        assert "mootdx" in FETCHER_REGISTRY
+        assert DEFAULT_ROUTE_TABLE["daily_bars"]["cn"][-1] == "mootdx"
+        for data_type in ["xdxr", "stock_list", "realtime_quotes"]:
             assert DEFAULT_ROUTE_TABLE[data_type]["cn"] == ["mootdx"]
+        for data_type in ["fundamentals", "minute_bars"]:
+            assert DEFAULT_ROUTE_TABLE[data_type]["cn"] == ["mootdx", "public"]
+
+    def test_public_is_supplement_for_reconciled_interfaces(self):
+        for data_type in ["fundamentals", "minute_bars"]:
+            assert DEFAULT_ROUTE_TABLE[data_type]["cn"][0] == "mootdx"
+            assert "public" in DEFAULT_ROUTE_TABLE[data_type]["cn"]
+        assert DEFAULT_ROUTE_TABLE["fund_bars"]["cn"] == ["public"]
 
     def test_calendar_and_daily_index_do_not_depend_on_mootdx(self):
         assert DEFAULT_ROUTE_TABLE["trade_calendar"]["cn"] == ["baostock"]

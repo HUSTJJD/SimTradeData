@@ -25,10 +25,14 @@ Usage:
 """
 
 import argparse
+import hashlib
+import json
 import logging
+import os
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from tqdm import tqdm
@@ -54,31 +58,68 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def get_remote_file_info(url: str) -> dict:
-    """
-    Get remote file info (size, last-modified) via HEAD request.
+META_SUFFIX = ".meta.json"
 
-    Args:
-        url: Download URL
 
-    Returns:
-        Dict with 'size' and 'last_modified' keys
-    """
+def _meta_path(dest_path: Path) -> Path:
+    return dest_path.with_name(dest_path.name + META_SUFFIX)
+
+
+def read_package_meta(dest_path: Path) -> dict:
+    """Load the content fingerprint recorded after the last successful download."""
+    path = _meta_path(dest_path)
+    if not path.is_file():
+        return {}
     try:
-        req = Request(url, method="HEAD")
-        req.add_header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError):
+        return {}
 
+
+def write_package_meta(dest_path: Path, meta: dict) -> None:
+    """Persist the fingerprint atomically so a crashed download leaves no stale meta."""
+    path = _meta_path(dest_path)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def get_remote_file_info(url: str, local_meta: dict | None = None) -> dict:
+    """HEAD the package with conditional headers when a local fingerprint exists.
+
+    A 304 response means the server confirmed the cached bytes are unchanged,
+    so the 500MB transfer can be skipped entirely. Returns an ``unchanged``
+    flag alongside size / last_modified / etag.
+    """
+    req = Request(url, method="HEAD")
+    req.add_header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+    meta = local_meta or {}
+    if meta.get("etag"):
+        req.add_header("If-None-Match", meta["etag"])
+    elif meta.get("last_modified"):
+        req.add_header("If-Modified-Since", meta["last_modified"])
+    try:
         with urlopen(req, timeout=30) as response:
             size = response.headers.get("Content-Length")
-            last_modified = response.headers.get("Last-Modified")
-
             return {
                 "size": int(size) if size else None,
-                "last_modified": last_modified,
+                "last_modified": response.headers.get("Last-Modified"),
+                "etag": response.headers.get("ETag"),
+                "unchanged": False,
             }
+    except HTTPError as exc:
+        if exc.code == 304 and meta:
+            return {
+                "size": meta.get("size"),
+                "last_modified": meta.get("last_modified"),
+                "etag": meta.get("etag"),
+                "unchanged": True,
+            }
+        raise
     except Exception as e:
         logger.warning(f"Failed to get remote file info: {e}")
-        return {"size": None, "last_modified": None}
+        return {"size": None, "last_modified": None, "etag": None, "unchanged": False}
 
 
 def download_file(url: str, dest_path: Path, show_progress: bool = True, progress_callback=None) -> bool:
@@ -93,6 +134,7 @@ def download_file(url: str, dest_path: Path, show_progress: bool = True, progres
     Returns:
         True if download succeeded
     """
+    temp_path = dest_path.with_suffix(".tmp")
     try:
         req = Request(url)
         req.add_header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
@@ -104,8 +146,8 @@ def download_file(url: str, dest_path: Path, show_progress: bool = True, progres
             if progress_callback:
                 progress_callback(0, total_size)
 
-            # Create temp file first, then move
-            temp_path = dest_path.with_suffix(".tmp")
+            # Hash while streaming so the fingerprint costs no extra disk read.
+            digest = hashlib.sha256()
 
             with open(temp_path, "wb") as f:
                 if show_progress and total_size:
@@ -122,6 +164,7 @@ def download_file(url: str, dest_path: Path, show_progress: bool = True, progres
                                 break
                             f.write(chunk)
                             downloaded += len(chunk)
+                            digest.update(chunk)
                             if progress_callback:
                                 progress_callback(downloaded, total_size)
                             pbar.update(len(chunk))
@@ -132,6 +175,7 @@ def download_file(url: str, dest_path: Path, show_progress: bool = True, progres
                             break
                         f.write(chunk)
                         downloaded += len(chunk)
+                        digest.update(chunk)
                         if progress_callback:
                             progress_callback(downloaded, total_size)
 
@@ -145,46 +189,60 @@ def download_file(url: str, dest_path: Path, show_progress: bool = True, progres
                 )
                 return False
 
-            # Move temp file to final destination
-            temp_path.rename(dest_path)
+            # Atomically replace the existing package. Path.rename() fails on
+            # Windows with WinError 183 when the destination already exists.
+            os.replace(temp_path, dest_path)
+            write_package_meta(dest_path, {
+                "etag": response.headers.get("ETag"),
+                "last_modified": response.headers.get("Last-Modified"),
+                "size": downloaded_size,
+                "sha256": digest.hexdigest(),
+                "downloaded_at": datetime.now().isoformat(timespec="seconds"),
+            })
             return True
 
     except Exception as e:
         logger.error(f"Download failed: {e}")
         print(f"Error: Download failed - {e}")
+        temp_path.unlink(missing_ok=True)
         return False
 
 
 def needs_update(local_path: Path, remote_info: dict) -> bool:
-    """
-    Check if local file needs update based on remote info.
+    """Decide whether the cached package differs from the remote one.
 
-    Args:
-        local_path: Path to local file
-        remote_info: Dict with remote file info
-
-    Returns:
-        True if update is needed
+    Priority: server-confirmed 304, then size mismatch, then ETag, then
+    Last-Modified. Falls back to the legacy size-only check when no local
+    fingerprint exists yet (first run after upgrading).
     """
     if not local_path.exists():
         return True
+    if remote_info.get("unchanged"):
+        return False
 
-    # Check size
-    if remote_info.get("size"):
-        local_size = local_path.stat().st_size
-        if local_size != remote_info["size"]:
-            return True
+    meta = read_package_meta(local_path)
+    remote_size = remote_info.get("size")
+    if remote_size and local_path.stat().st_size != remote_size:
+        return True
 
-    if remote_info.get("last_modified"):
+    etag = remote_info.get("etag")
+    if etag and meta.get("etag"):
+        return meta["etag"] != etag
+    last_modified = remote_info.get("last_modified")
+    if last_modified and meta.get("last_modified"):
+        return meta["last_modified"] != last_modified
+
+    # No sidecar fingerprint yet (first run after upgrading): fall back to
+    # Last-Modified vs the local file mtime instead of blindly trusting it.
+    if last_modified:
         try:
-            modified = parsedate_to_datetime(remote_info["last_modified"])
+            modified = parsedate_to_datetime(last_modified)
             if modified.tzinfo is None:
                 modified = modified.replace(tzinfo=timezone.utc)
             if modified > datetime.fromtimestamp(local_path.stat().st_mtime, timezone.utc):
                 return True
         except (TypeError, ValueError, OverflowError):
             return True
-
     return False
 
 

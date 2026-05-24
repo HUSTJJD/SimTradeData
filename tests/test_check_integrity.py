@@ -1,11 +1,28 @@
 import json
 import os
+import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import duckdb
+import pytest
 
 from scripts.check_integrity import check_integrity
+
+
+def _git_bash_path(path) -> str:
+    """Render a Windows path the Git-Bash/MSYS tools can consume."""
+    value = Path(path).as_posix()
+    if os.name == "nt" and len(value) > 2 and value[1] == ":":
+        return f"/{value[0].lower()}{value[2:]}"
+    return value
+
+
+def _write_lf_executable(path, source: str) -> None:
+    """Path.write_text() would emit CRLF and break the shebang on Windows."""
+    path.write_bytes(source.replace("\r\n", "\n").encode("utf-8"))
+    path.chmod(0o755)
 
 
 def create_db(path, include_active_valuation=True, include_security_type=True):
@@ -81,7 +98,7 @@ def _seed_gate_tables(conn):
         """
     )
     conn.execute(
-        "INSERT INTO benchmark VALUES ('2015-01-01', 1.0, 1.0, 1.0, 1.0, 1.0, 1.0)"
+        "INSERT INTO benchmark VALUES ('2015-01-05', 1.0, 1.0, 1.0, 1.0, 1.0, 1.0)"
     )
     conn.execute("ALTER TABLE stock_metadata ADD COLUMN blocks VARCHAR")
     conn.execute(
@@ -503,7 +520,8 @@ def test_daily_pipeline_waits_until_final_attempt_before_lagging_local_release(
     release_attempt_file = tmp_path / "release_attempt"
 
     fake_python = fake_bin / "python-stub"
-    fake_python.write_text(
+    _write_lf_executable(
+        fake_python,
         """#!/bin/bash
 set -euo pipefail
 
@@ -529,12 +547,15 @@ fi
 echo "unexpected python command: $*" >&2
 exit 127
 """,
-        encoding="utf-8",
     )
-    fake_python.chmod(0o755)
+
+    # Git Bash has no util-linux `flock`; stub it just like the python and
+    # release scripts so the real run_daily.sh can be exercised on Windows.
+    _write_lf_executable(fake_bin / "flock", "#!/bin/bash\nexit 0\n")
 
     release_script = scripts_dir / "release_data.sh"
-    release_script.write_text(
+    _write_lf_executable(
+        release_script,
         """#!/bin/bash
 set -euo pipefail
 
@@ -548,30 +569,43 @@ manifest_dir="${SIMTRADE_DATA_DIR:?}/data/export/${MARKET:?}"
 mkdir -p "$manifest_dir"
 printf '{"version":"%s"}\\n' "${SIMTRADE_TEST_VERSION:?}" >"$manifest_dir/manifest.json"
 """,
-        encoding="utf-8",
     )
-    release_script.chmod(0o755)
+
+    bash = shutil.which("bash")
+    if bash is None:
+        pytest.skip("daily pipeline test requires bash")
+
+    on_windows = os.name == "nt"
+
+    def shell_path(value):
+        return _git_bash_path(value) if on_windows else str(value)
 
     env = os.environ.copy()
     env.update(
         {
             "DOWNLOAD_ATTEMPTS": "3",
             "INTEGRITY_STRICT": "1",
-            "LOCK_FILE": str(tmp_path / "daily.lock"),
-            "LOG_DIR": str(tmp_path / "logs"),
+            "LOCK_FILE": shell_path(tmp_path / "daily.lock"),
+            "LOG_DIR": shell_path(tmp_path / "logs"),
             "MARKET": "cn",
-            "PYTHON": str(fake_python),
+            "PYTHON": shell_path(fake_python),
             "PUBLISH_TARGETS": "local",
             "RETRY_INTERVAL_SECONDS": "0",
-            "SIMTRADE_DATA_DIR": str(project_dir),
-            "SIMTRADE_TEST_ATTEMPTS": str(attempts_file),
-            "SIMTRADE_TEST_RELEASE_ATTEMPT": str(release_attempt_file),
+            "SIMTRADE_DATA_DIR": shell_path(project_dir),
+            "SIMTRADE_TEST_ATTEMPTS": shell_path(attempts_file),
+            "SIMTRADE_TEST_RELEASE_ATTEMPT": shell_path(release_attempt_file),
             "SIMTRADE_TEST_VERSION": "2026-06-24",
         }
     )
+    if on_windows:
+        # Bash-side commands need MSYS-style PATH entries; the Windows PATH
+        # (semicolon separated, backslashes) is not usable inside the script.
+        env["PATH"] = f"{_git_bash_path(fake_bin)}:/usr/bin:/bin"
+    else:
+        env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
 
     result = subprocess.run(
-        ["/bin/bash", str(Path("scripts/run_daily.sh").resolve())],
+        [bash, shell_path(Path("scripts/run_daily.sh").resolve())],
         check=False,
         env=env,
         stdout=subprocess.PIPE,

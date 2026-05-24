@@ -7,6 +7,11 @@ from pathlib import Path
 
 _IS_WINDOWS = os.name == "nt"
 
+# Windows byte-range locks deny *all* other handles (including read-only ones)
+# access to the locked region. Lock a byte far beyond EOF instead of byte 0 so
+# the PID text at the start of the file stays readable while the lock is held.
+_LOCK_REGION_OFFSET = 1 << 30
+
 if _IS_WINDOWS:
     import msvcrt
 else:
@@ -26,10 +31,10 @@ class ProcessLock:
     def __enter__(self):
         self.lock_file.parent.mkdir(parents=True, exist_ok=True)
         self.lock_fd = open(self.lock_file, "a+")
-        self.lock_fd.seek(0)
 
         try:
             if _IS_WINDOWS:
+                self.lock_fd.seek(_LOCK_REGION_OFFSET)
                 msvcrt.locking(self.lock_fd.fileno(), msvcrt.LK_NBLCK, 1)
             else:
                 fcntl.flock(self.lock_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -42,6 +47,7 @@ class ProcessLock:
             sys.exit(1)
 
         try:
+            self.lock_fd.seek(0)
             self.lock_fd.truncate(0)
             self.lock_fd.write(str(os.getpid()))
             self.lock_fd.flush()
@@ -55,7 +61,7 @@ class ProcessLock:
         if self.lock_fd and not self.lock_fd.closed:
             try:
                 if _IS_WINDOWS:
-                    self.lock_fd.seek(0)
+                    self.lock_fd.seek(_LOCK_REGION_OFFSET)
                     msvcrt.locking(self.lock_fd.fileno(), msvcrt.LK_UNLCK, 1)
                 else:
                     fcntl.flock(self.lock_fd.fileno(), fcntl.LOCK_UN)

@@ -13,6 +13,27 @@ release path.
 - Host-specific paths belong in `/etc/simtradedata.env`, not in unit files.
 - Failed jobs do not loop forever; keep the last known-good release.
 
+## Local environment parity
+
+The parent repository's `docs/environment_matrix.json` registers this
+submodule's `.venv` as the `host_data` interpreter: **Python 3.11.18** with
+duckdb 1.5.6 / pyarrow 19.0.1 / pandas 2.3.3 / numpy 1.26.4, matching the
+PTrade 3.11 whitelist. `tools/check_research_assets.py` in the parent repo
+fails when `pyvenv.cfg` reports a different minor version.
+
+`.python-version` here is inherited from upstream (3.12) and is intentionally
+left untouched; a bare `uv sync` therefore recreates a 3.12 environment and
+breaks that guard. Always sync with an explicit interpreter:
+
+```bash
+uv sync --frozen --python 3.11.18
+```
+
+`pydantic==1.10.7` is a declared dev dependency (same pin as
+`PTrade/constraints-ptrade-py311.txt`) because the publish-time PTrade smoke
+check imports `simtradelab.ptrade.storage`; without it the engine branch is
+silently skipped and only the direct Parquet check runs.
+
 ## Task Layers
 
 | Task | Frequency | Publishes | Purpose |

@@ -5,8 +5,15 @@ Project path management
 Provides unified path access for all project code.
 """
 
+import gc
 import shutil
+import time
 from pathlib import Path
+
+
+_WINDOWS_SHARING_VIOLATION = 32
+_RMTREE_RETRIES = 8
+_RMTREE_RETRY_DELAY = 0.05
 
 
 def get_project_root() -> Path:
@@ -52,7 +59,9 @@ def safe_rmtree(path: Path) -> None:
     """Remove a directory tree with basic safety guards.
 
     Refuses to delete top-level system paths to prevent catastrophic
-    data loss from misconfigured output directories.
+    data loss from misconfigured output directories. Windows can briefly
+    retain a handle on a just-written file (WinError 32); retry only that
+    sharing violation a finite number of times.
     """
     resolved = path.resolve()
     dangerous = {Path("/"), Path.home()}
@@ -61,5 +70,17 @@ def safe_rmtree(path: Path) -> None:
             f"Refusing to delete unsafe path: {resolved}. "
             f"Check output_dir configuration."
         )
-    shutil.rmtree(path)
+    for attempt in range(_RMTREE_RETRIES):
+        try:
+            shutil.rmtree(path)
+            return
+        except PermissionError as exc:
+            if getattr(exc, "winerror", None) != _WINDOWS_SHARING_VIOLATION:
+                raise
+            if attempt == _RMTREE_RETRIES - 1:
+                raise
+            gc.collect()
+            if not path.exists():
+                return
+            time.sleep(_RMTREE_RETRY_DELAY)
 

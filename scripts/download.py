@@ -11,6 +11,7 @@ Each source only downloads data it's best suited for, avoiding redundancy.
 """
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -112,6 +113,58 @@ def run_tdx_import(source_path: str, db_path: str = DEFAULT_DB_PATH) -> bool:
         return False
 
 
+def _stocks_fingerprint(db_path: str) -> tuple[int, str] | None:
+    """Cheap read-only DB fingerprint to detect a restored or rewritten DB."""
+    try:
+        import duckdb
+
+        con = duckdb.connect(str(db_path), read_only=True)
+        try:
+            rows, max_date = con.execute(
+                "SELECT COUNT(*), CAST(MAX(date) AS VARCHAR) FROM stocks"
+            ).fetchone()
+            return int(rows), str(max_date or "")
+        finally:
+            con.close()
+    except Exception:
+        return None
+
+
+def _tdx_import_is_current(zip_path, db_path, meta: dict) -> bool:
+    """True when this exact package was already imported into this DB."""
+    imported = meta.get("imported")
+    if not isinstance(imported, dict):
+        return False
+    if not meta.get("sha256") or imported.get("sha256") != meta["sha256"]:
+        return False
+    fingerprint = _stocks_fingerprint(str(db_path))
+    if fingerprint is None:
+        return False
+    return (
+        fingerprint[0] >= int(imported.get("stocks_rows", 0))
+        and fingerprint[1] >= str(imported.get("stocks_max", ""))
+    )
+
+
+def _mark_tdx_imported(zip_path, db_path, meta: dict) -> None:
+    """Record that the current package bytes are present in the DB."""
+    from datetime import datetime
+
+    from download_tdx_day import write_package_meta
+
+    fingerprint = _stocks_fingerprint(str(db_path))
+    if fingerprint is None:
+        return
+    updated = dict(meta)
+    updated["imported"] = {
+        "sha256": meta.get("sha256"),
+        "stocks_rows": fingerprint[0],
+        "stocks_max": fingerprint[1],
+        "imported_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    write_package_meta(zip_path, updated)
+
+
 def run_tdx_download_and_import(db_path: str = DEFAULT_DB_PATH) -> bool:
     """Download hsjday.zip from TDX website and import.
 
@@ -131,23 +184,43 @@ def run_tdx_download_and_import(db_path: str = DEFAULT_DB_PATH) -> bool:
             download_file,
             get_remote_file_info,
             needs_update,
+            read_package_meta,
         )
         from import_tdx_day import TdxDayImporter
 
         zip_path = DOWNLOAD_DIR / "hsjday.zip"
+        meta = read_package_meta(zip_path)
 
         print("\nChecking remote file...")
-        remote_info = get_remote_file_info(DOWNLOAD_URL)
+        remote_info = get_remote_file_info(DOWNLOAD_URL, local_meta=meta)
         if remote_info.get("size"):
             print(f"  Remote size: {remote_info['size'] / 1024 / 1024:.1f} MB")
 
-        if needs_update(zip_path, remote_info):
+        package_changed = needs_update(zip_path, remote_info)
+        if package_changed:
             print("\nDownloading hsjday.zip...")
             if not download_file(DOWNLOAD_URL, zip_path):
                 return False
+            meta = read_package_meta(zip_path)
             print(f"Downloaded to: {zip_path}")
         else:
             print("Local file is up to date, skipping download.")
+            # Backfill the fingerprint on the first run after upgrading so the
+            # next run can short-circuit with a conditional HEAD.
+            if remote_info.get("etag") or remote_info.get("last_modified"):
+                from download_tdx_day import write_package_meta
+
+                meta = {
+                    **meta,
+                    "etag": remote_info.get("etag") or meta.get("etag"),
+                    "last_modified": remote_info.get("last_modified") or meta.get("last_modified"),
+                    "size": remote_info.get("size") or meta.get("size"),
+                }
+                write_package_meta(zip_path, meta)
+
+        if not package_changed and _tdx_import_is_current(zip_path, db_path, meta):
+            print("Package unchanged since last import; skipping TDX import.")
+            return True
 
         # Import
         print("\nImporting data...")
@@ -166,9 +239,12 @@ def run_tdx_download_and_import(db_path: str = DEFAULT_DB_PATH) -> bool:
                 print(f"  Benchmark indices imported: {sorted(imported)}")
             except ValueError as e:
                 print(f"  WARNING: benchmark index import skipped: {e}")
-            return True
+            import_ok = True
         finally:
             importer.close()
+        if import_ok:
+            _mark_tdx_imported(zip_path, db_path, meta)
+        return True
 
     except Exception as e:
         print(f"Error in TDX download & import: {e}")
@@ -181,6 +257,7 @@ def run_mootdx_download(
     refresh_fundamentals: bool = False,
     skip_ohlcv: bool = True,
     skip_bonus_fix: bool = False,
+    start_date: str | None = None,
 ) -> bool:
     """Run Mootdx download phase."""
     print("\n" + "=" * 70)
@@ -205,6 +282,7 @@ def run_mootdx_download(
             refresh_fundamentals=refresh_fundamentals,
             skip_ohlcv=skip_ohlcv,
             skip_bonus_fix=skip_bonus_fix,
+            start_date=start_date,
         )
         return True
     except Exception as e:
@@ -212,12 +290,18 @@ def run_mootdx_download(
         return False
 
 
-def run_baostock_download(valuation_only: bool = True) -> bool:
+def run_baostock_download(
+    valuation_only: bool = True,
+    start_date: str | None = None,
+    full_history: bool = False,
+) -> bool:
     """Run BaoStock download phase.
 
     Args:
         valuation_only: If True, only download valuation + status + index constituents.
                        If False, run full BaoStock download.
+        start_date: Explicit history floor (usually ``--history-start``).
+        full_history: Restore full-range monthly sampling for a rebuild.
     """
     print("\n" + "=" * 70)
     print("Phase 2: BaoStock Data Download")
@@ -235,6 +319,8 @@ def run_baostock_download(valuation_only: bool = True) -> bool:
             skip_fundamentals=True,  # Mootdx handles fundamentals
             skip_metadata=False,  # BaoStock owns index constituent metadata
             valuation_only=valuation_only,
+            start_date=start_date,
+            full_history=full_history,
         )
         return True
     except Exception as e:
@@ -287,6 +373,12 @@ Examples:
         help="Run BaoStock in full mode instead of valuation-only mode",
     )
     parser.add_argument(
+        "--history-start",
+        type=str,
+        default=None,
+        help="Full-history rebuild floor (YYYY-MM-DD); sets SIMTRADE_CN_HISTORY_START",
+    )
+    parser.add_argument(
         "--refresh-fundamentals",
         action="store_true",
         help="Force re-download all financial data quarters",
@@ -317,6 +409,10 @@ Examples:
     )
 
     args = parser.parse_args()
+
+    history_start = args.history_start or os.environ.get("SIMTRADE_CN_HISTORY_START")
+    if history_start:
+        os.environ["SIMTRADE_CN_HISTORY_START"] = history_start
 
     # Status only mode
     if args.status:
@@ -355,13 +451,18 @@ Examples:
             refresh_fundamentals=args.refresh_fundamentals,
             skip_ohlcv=True,
             skip_bonus_fix=args.skip_bonus_fix,
+            start_date=history_start,
         ):
             mootdx_failed = True
 
     # Phase 2: BaoStock
     baostock_failed = False
     if args.source in ["baostock", "all"]:
-        if not run_baostock_download(valuation_only=not args.baostock_full):
+        if not run_baostock_download(
+            valuation_only=not args.baostock_full,
+            start_date=history_start,
+            full_history=bool(args.history_start),
+        ):
             baostock_failed = True
 
     # Only a failed primary source is fatal. When TDX supplied OHLCV, the

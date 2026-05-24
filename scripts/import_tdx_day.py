@@ -28,11 +28,11 @@ Usage:
 import argparse
 import logging
 import os
-import struct
 import zipfile
 from pathlib import Path
 from typing import Iterator, Optional, Tuple
 
+import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
@@ -51,6 +51,19 @@ CN_HISTORY_START_INT = int(_env_history_start.replace("-", "")) if _env_history_
 # TDX binary format constants
 RECORD_SIZE = 32  # bytes per record
 RECORD_FORMAT = "<IIIIIfII"  # date, open, high, low, close, amount, volume, reserved
+# Mirrors RECORD_FORMAT; a structured view decodes all records with one frombuffer.
+TDX_DAY_DTYPE = np.dtype(
+    [
+        ("date", "<u4"),
+        ("open", "<u4"),
+        ("high", "<u4"),
+        ("low", "<u4"),
+        ("close", "<u4"),
+        ("amount", "<f4"),
+        ("volume", "<u4"),
+        ("reserved", "<u4"),
+    ]
+)
 
 # Ensure log directory exists
 Path(LOG_FILE).parent.mkdir(parents=True, exist_ok=True)
@@ -96,52 +109,79 @@ def parse_tdx_day_file(data: bytes, price_divisor: float = 100.0, dates=None) ->
         return pd.DataFrame()
 
     num_records = len(data) // RECORD_SIZE
-    records = []
+    raw_records = np.frombuffer(data, dtype=TDX_DAY_DTYPE, count=num_records)
 
-    for i in range(num_records):
-        offset = i * RECORD_SIZE
-        if dates is not None and struct.unpack_from('<I', data, offset)[0] not in dates:
-            continue
-        record = data[offset : offset + RECORD_SIZE]
+    date_ints = raw_records["date"]
+    year = date_ints // 10000
+    month = (date_ints % 10000) // 100
+    day = date_ints % 100
 
-        try:
-            date_int, open_p, high, low, close, amount, volume, _ = struct.unpack(
-                RECORD_FORMAT, record
+    # Silently drop the same invalid, excluded and history-trimmed records as
+    # the old per-record parser, but with one vectorized mask.
+    valid = (
+        (year >= 1990)
+        & (year <= 2100)
+        & (month >= 1)
+        & (month <= 12)
+        & (day >= 1)
+        & (day <= 31)
+    )
+    if CN_HISTORY_START_INT is not None:
+        valid &= date_ints >= CN_HISTORY_START_INT
+    if dates is not None:
+        wanted_values = list(dates)
+        wanted_dates = np.asarray(wanted_values)
+        if wanted_dates.dtype.kind in "iuf":
+            valid &= np.isin(date_ints, wanted_dates)
+        else:
+            # Preserve Python ``in`` semantics for non-numeric containers.
+            try:
+                wanted_container = set(wanted_values)
+            except TypeError:
+                wanted_container = wanted_values
+            valid &= np.fromiter(
+                (int(date_int) in wanted_container for date_int in date_ints),
+                dtype=bool,
+                count=num_records,
             )
 
-            # Parse date
-            year = date_int // 10000
-            month = (date_int % 10000) // 100
-            day = date_int % 100
-
-            # Skip invalid dates
-            if year < 1990 or year > 2100 or month < 1 or month > 12 or day < 1 or day > 31:
-                continue
-
-            # Skip rows before the configured history start (when set)
-            if CN_HISTORY_START_INT is not None and date_int < CN_HISTORY_START_INT:
-                continue
-
-            # Convert prices from fen to yuan
-            records.append(
-                {
-                    "date": f"{year:04d}-{month:02d}-{day:02d}",
-                    "open": open_p / price_divisor,
-                    "high": high / price_divisor,
-                    "low": low / price_divisor,
-                    "close": close / price_divisor,
-                    "volume": volume,
-                    "money": amount,
-                }
-            )
-        except struct.error:
-            continue
-
-    if not records:
+    if not valid.any():
         return pd.DataFrame()
 
-    df = pd.DataFrame(records)
-    df["date"] = pd.to_datetime(df["date"])
+    if price_divisor == 0:
+        # NumPy division would return inf; keep the old scalar-division error.
+        raise ZeroDivisionError("division by zero")
+
+    valid_dates = date_ints[valid]
+    try:
+        # Explicit YYYYMMDD parsing is much faster than building ISO strings.
+        parsed_dates = pd.to_datetime(valid_dates.astype(str), format="%Y%m%d")
+    except ValueError:
+        # Impossible calendar dates are rare; use the old formatted-string path
+        # so pandas raises the same DateParseError as before.
+        old_style_dates = []
+        for date_int in valid_dates:
+            value = int(date_int)
+            old_style_dates.append(
+                f"{value // 10000:04d}-"
+                f"{(value % 10000) // 100:02d}-"
+                f"{value % 100:02d}"
+            )
+        parsed_dates = pd.to_datetime(pd.Series(old_style_dates))
+    parsed_dates = np.asarray(parsed_dates, dtype="datetime64[ns]")
+
+    # Cast to the Python scalar dtypes produced by the old dict-per-record path.
+    df = pd.DataFrame(
+        {
+            "date": parsed_dates,
+            "open": raw_records["open"][valid].astype(np.float64) / price_divisor,
+            "high": raw_records["high"][valid].astype(np.float64) / price_divisor,
+            "low": raw_records["low"][valid].astype(np.float64) / price_divisor,
+            "close": raw_records["close"][valid].astype(np.float64) / price_divisor,
+            "volume": raw_records["volume"][valid].astype(np.int64),
+            "money": raw_records["amount"][valid].astype(np.float64),
+        }
+    )
     return df
 
 
@@ -155,8 +195,9 @@ def iter_day_files_from_zip(
 
     Args:
         zip_path: Path to ZIP file
-        wanted: If given, only yield PTrade codes in this set
-            (filters before decompressing each member)
+        wanted: If given, only yield PTrade codes in this set. Otherwise,
+            only stock/ETF filenames are considered. Both filters run before
+            decompressing each member.
 
     Yields:
         Tuples of (filename, file_content)
@@ -175,7 +216,12 @@ def iter_day_files_from_zip(
             # Extract filename (e.g., sh600000.day)
             filename = normalized.split("/")[-1]
 
-            if wanted is not None and filename_to_ptrade_code(filename) not in wanted:
+            if wanted is not None:
+                if filename_to_ptrade_code(filename) not in wanted:
+                    continue
+            elif not is_stock_code(filename):
+                # Index/bond/warrant members are decompressed only when a
+                # caller explicitly asks for them via ``wanted``.
                 continue
 
             yield filename, zf.read(name)
@@ -280,6 +326,17 @@ class TdxDayImporter:
         self.writer = DuckDBWriter(db_path=str(self.db_path))
         self.full_import = full_import
 
+        # One grouped scan replaces two MIN/MAX point queries per symbol.
+        self.existing_date_ranges = {}
+        if not full_import:
+            for symbol, min_date, max_date in self.writer.conn.execute(
+                "SELECT symbol, MIN(date), MAX(date) FROM stocks GROUP BY symbol"
+            ).fetchall():
+                self.existing_date_ranges[symbol] = (
+                    str(min_date) if min_date is not None else None,
+                    str(max_date) if max_date is not None else None,
+                )
+
         self.stats = {
             "files_processed": 0,
             "files_skipped": 0,
@@ -297,9 +354,7 @@ class TdxDayImporter:
         """
         if self.full_import:
             return None, None
-        min_date = self.writer.get_min_date("stocks", symbol)
-        max_date = self.writer.get_max_date("stocks", symbol)
-        return min_date, max_date
+        return self.existing_date_ranges.get(symbol, (None, None))
 
     def import_stock(self, symbol: str, df: pd.DataFrame, existing_range=None) -> int:
         """
@@ -321,7 +376,10 @@ class TdxDayImporter:
             return 0
 
         # Check existing data range for incremental import
-        min_date, max_date = existing_range if existing_range is not None and not self.full_import else self.get_existing_date_range(symbol)
+        if existing_range is not None and not self.full_import:
+            min_date, max_date = existing_range
+        else:
+            min_date, max_date = self.get_existing_date_range(symbol)
 
         if min_date and max_date:
             min_dt = pd.to_datetime(min_date)
@@ -373,15 +431,21 @@ class TdxDayImporter:
             Statistics dict
         """
         # Determine source type
+        non_stock_files = 0
         if source_path.is_file() and source_path.suffix.lower() == ".zip":
             file_iter = iter_day_files_from_zip(source_path)
-            # Count total files
+            # Count total files and pre-account for members the iterator skips
+            # before decompression.
             with zipfile.ZipFile(source_path, "r") as zf:
-                total_files = sum(
-                    1
-                    for n in zf.namelist()
-                    if n.endswith(".day") and "lday" in n.replace("\\", "/")
-                )
+                total_files = 0
+                for name in zf.namelist():
+                    normalized = name.replace("\\", "/")
+                    if not normalized.endswith(".day") or "/lday/" not in normalized:
+                        continue
+                    total_files += 1
+                    if not is_stock_code(normalized.split("/")[-1]):
+                        non_stock_files += 1
+            self.stats["files_skipped"] += non_stock_files
         elif source_path.is_dir():
             # Count files first
             total_files = sum(
@@ -403,6 +467,8 @@ class TdxDayImporter:
         batch_data = []
 
         with tqdm(total=total_files, desc="Importing", unit="file", ncols=100) as pbar:
+            if non_stock_files:
+                pbar.update(non_stock_files)
             for filename, data in file_iter:
                 pbar.update(1)
 

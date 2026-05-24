@@ -1,5 +1,9 @@
-"""XDXR conversion must drop pre-floor rows so sparse-refill cannot
-re-introduce history the deployment has cut."""
+"""XDXR conversion keeps full corporate-action history for adjusted prices.
+
+A configured daily-history floor trims OHLCV imports, but exrights events
+before that floor must remain because post-floor adjusted prices depend on
+historical company actions.
+"""
 
 import importlib
 
@@ -31,7 +35,7 @@ def _convert(xdxr_df):
     return downloader._convert_xdxr_to_exrights(xdxr_df)
 
 
-def test_xdxr_conversion_drops_pre_floor_rows(monkeypatch):
+def test_xdxr_conversion_keeps_pre_floor_rows(monkeypatch):
     import simtradedata.config.field_mappings as fm
     from scripts import download_mootdx
 
@@ -41,8 +45,12 @@ def test_xdxr_conversion_drops_pre_floor_rows(monkeypatch):
 
     result = _convert(_make_xdxr_df())
 
-    assert list(result["date"]) == [pd.Timestamp("2020-06-03")]
-    assert len(result) == 1
+    assert len(result) == 3
+    assert list(result["date"]) == [
+        pd.Timestamp("1993-11-01"),
+        pd.Timestamp("2004-01-02"),
+        pd.Timestamp("2020-06-03"),
+    ]
 
 
 def test_xdxr_conversion_keeps_full_history_without_floor(monkeypatch):
