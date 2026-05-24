@@ -11,11 +11,15 @@ Output: DuckDB database (data/cn.duckdb)
 Export to Parquet: use scripts/export_parquet.py
 """
 
+from filelock import FileLock, Timeout
 import json
 import logging
 import os
+import sys
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
+import concurrent.futures
 
 import baostock as bs
 import pandas as pd
@@ -23,6 +27,7 @@ from tqdm import tqdm
 
 from simtradedata.config.field_mappings import BENCHMARK_CONFIG
 from simtradedata.fetchers.baostock_fetcher import BaoStockFetcher
+from simtradedata.fetchers.public_source_fetcher import statement_on_date
 from simtradedata.fetchers.unified_fetcher import UnifiedDataFetcher
 from simtradedata.processors.data_splitter import DataSplitter
 from simtradedata.utils.process_lock import ProcessLock
@@ -52,6 +57,41 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+class ProcessLock:
+    """Process lock to prevent multiple instances from running simultaneously"""
+
+    def __init__(self, lock_file: str):
+        self.lock_file = Path(lock_file)
+        self.lock_file.parent.mkdir(parents=True, exist_ok=True)
+        self.lock_fd = None
+        self.file_lock = FileLock(str(self.lock_file), timeout=-1)
+
+    def __enter__(self):
+        try:
+            self.file_lock.acquire()
+            self.lock_fd = open(self.lock_file, "w")
+            self.lock_fd.write(str(os.getpid()))
+        except Timeout:
+            print("\nError: Another download process is running")
+            print(f"Lock file: {self.lock_file}")
+            print(f"\nIf no other process is running, delete the lock file:")
+            print(f"  rm {self.lock_file}")
+            sys.exit(1)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.lock_fd:
+            try:
+                self.lock_fd.close()
+                self.file_lock.release()
+            except Exception:
+                pass
+        try:
+            self.lock_file.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
 class EfficientBaoStockDownloader:
     """Efficient BaoStock data downloader with DuckDB storage"""
 
@@ -76,6 +116,26 @@ class EfficientBaoStockDownloader:
 
         self.status_cache = {}
         self.failed_stocks = []
+        self._public_statements = {}
+
+    def _public_statement(self, symbol: str) -> pd.DataFrame:
+        """一只股票只拉一次新浪报表，并补到已经入库的报告期上。"""
+        cached = self._public_statements.get(symbol)
+        if cached is not None:
+            return cached
+        try:
+            from simtradedata.fetchers.public_source_fetcher import (
+                PublicSourceFetcher,
+            )
+
+            frame = PublicSourceFetcher().fetch_fundamentals(symbol)
+        except Exception as exc:
+            logger.warning("新浪报表 %s: %s", symbol, exc)
+            frame = pd.DataFrame()
+        self._public_statements[symbol] = frame
+        if not frame.empty:
+            self.writer.fill_statement_fields(symbol, frame)
+        return frame
 
     def get_incremental_start_date(self, symbol: str) -> str:
         """
@@ -411,6 +471,7 @@ class EfficientBaoStockDownloader:
                     try:
                         for symbol in batch:
                             try:
+                                statement = self._public_statement(symbol)
                                 if self.writer.has_fundamental(symbol, q_end):
                                     skip_count += 1
                                     continue
@@ -421,6 +482,14 @@ class EfficientBaoStockDownloader:
                                         symbol, year, quarter
                                     )
                                 )
+                                extra = statement_on_date(statement, q_end)
+                                if fund_df.empty and extra:
+                                    fund_df = pd.DataFrame(
+                                        [{"end_date": pd.Timestamp(q_end), **extra}]
+                                    ).set_index("end_date")
+                                elif extra and len(fund_df) == 1:
+                                    for name, value in extra.items():
+                                        fund_df[name] = value
 
                                 if not fund_df.empty:
                                     if "end_date" in fund_df.columns:
@@ -701,15 +770,15 @@ def download_all_data(
             if not valuation_only:
                 print("  Trading calendar...")
                 try:
-                    trade_cal = downloader.standard_fetcher.fetch_trade_calendar(
+                        trade_cal = downloader.standard_fetcher.fetch_trade_calendar(
                         start_date_str, end_date_str
-                    )
-                    if not trade_cal.empty:
-                        trade_days = trade_cal[trade_cal["is_trading_day"] == "1"]
-                        trade_days = trade_days.rename(
-                            columns={"calendar_date": "trade_date"}
                         )
-                        downloader.writer.write_trade_days(trade_days)
+                        if not trade_cal.empty:
+                            trade_days = trade_cal[trade_cal["is_trading_day"] == "1"]
+                            trade_days = trade_days.rename(
+                                columns={"calendar_date": "trade_date"}
+                            )
+                            downloader.writer.write_trade_days(trade_days)
                         print(f"    {len(trade_days)} days")
                 except Exception as e:
                     logger.error(f"Failed to download trading calendar: {e}")
@@ -719,12 +788,12 @@ def download_all_data(
                 BENCHMARK_INDEX = BENCHMARK_CONFIG["default_index"]
                 print(f"  Benchmark index ({BENCHMARK_INDEX})...")
                 try:
-                    benchmark_df = downloader.unified_fetcher.fetch_index_data(
+                        benchmark_df = downloader.unified_fetcher.fetch_index_data(
                         BENCHMARK_INDEX, start_date_str, end_date_str
-                    )
-                    if not benchmark_df.empty:
-                        downloader.writer.write_benchmark(benchmark_df)
-                        print(f"    {len(benchmark_df)} days")
+                        )
+                        if not benchmark_df.empty:
+                            downloader.writer.write_benchmark(benchmark_df)
+                            print(f"    {len(benchmark_df)} days")
                 except Exception as e:
                     logger.error(f"Failed to download benchmark: {e}")
 

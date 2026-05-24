@@ -18,7 +18,8 @@ class TestRouteConfig:
     def test_daily_bars_cn_has_fallback(self):
         sources = DEFAULT_ROUTE_TABLE["daily_bars"]["cn"]
         assert len(sources) >= 2, "daily_bars/cn should have fallback sources"
-        assert sources[0] == "mootdx", "mootdx should be primary for daily_bars/cn"
+        assert sources[0] == "public", "public should be primary for daily_bars/cn"
+        assert "eastmoney" not in sources
 
     def test_daily_bars_us_uses_yfinance(self):
         sources = DEFAULT_ROUTE_TABLE["daily_bars"]["us"]

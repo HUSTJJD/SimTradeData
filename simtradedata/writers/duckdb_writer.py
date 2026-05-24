@@ -60,6 +60,12 @@ _FUNDAMENTAL_EXTRA_COLUMNS = [
     "net_profit",
     "np_parent_company_owners",
     "net_operate_cash_flow",
+    "dividend_interest_payment",
+    "oper_cash_ps_grow_rate",
+    "np_parent_company_cut",
+    "np_parent_company_cut_yoy",
+    "net_operate_cash_flow_ttm",
+    "net_operate_cash_flow_ps_ttm",
     "net_invest_cash_flow",
     "net_finance_cash_flow",
     "net_asset_grow_rate",
@@ -1008,6 +1014,47 @@ class DuckDBWriter:
 
         logger.debug(f"Wrote {len(df)} fundamental rows for {symbol}")
         return len(df)
+
+    def fill_statement_fields(self, symbol: str, df: pd.DataFrame) -> int:
+        """把已有报告期上的空列补上。新值是空的时候不覆盖旧值，也不新建行。"""
+        if df is None or df.empty:
+            return 0
+        work = df.copy()
+        if "end_date" in work.columns and "date" not in work.columns:
+            work = work.rename(columns={"end_date": "date"})
+        if "date" not in work.columns:
+            return 0
+        fields = [
+            "dividend_interest_payment",
+            "net_operate_cash_flow",
+            "oper_cash_ps_grow_rate",
+            "np_parent_company_cut",
+            "np_parent_company_cut_yoy",
+            "net_operate_cash_flow_ttm",
+            "net_operate_cash_flow_ps_ttm",
+        ]
+        fields = [name for name in fields if name in work.columns]
+        work["date"] = pd.to_datetime(work["date"]).dt.date
+        updated = 0
+        for row in work.to_dict("records"):
+            assigns = []
+            params = []
+            for name in fields:
+                value = row.get(name)
+                if value is None or pd.isna(value):
+                    continue
+                assigns.append(f"{name} = ?")
+                params.append(float(value))
+            if not assigns:
+                continue
+            params.extend([symbol, row["date"]])
+            self.conn.execute(
+                f"UPDATE fundamentals SET {', '.join(assigns)} "
+                "WHERE symbol = ? AND date = ?",
+                params,
+            )
+            updated += 1
+        return updated
 
     def write_exrights(self, symbol: str, df: pd.DataFrame) -> int:
         """Write exrights data with upsert"""

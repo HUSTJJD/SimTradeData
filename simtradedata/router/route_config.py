@@ -2,6 +2,7 @@
 
 # Dotted import paths for lazy instantiation.
 FETCHER_REGISTRY = {
+    "public": "simtradedata.fetchers.public_source_fetcher.PublicSourceFetcher",
     "mootdx": "simtradedata.fetchers.mootdx_unified_fetcher.MootdxUnifiedFetcher",
     "eastmoney": "simtradedata.fetchers.eastmoney_fetcher.EastMoneyFetcher",
     "baostock": "simtradedata.fetchers.unified_fetcher.UnifiedDataFetcher",
@@ -11,14 +12,14 @@ FETCHER_REGISTRY = {
 # data_type -> market -> [source priority list]
 DEFAULT_ROUTE_TABLE = {
     "daily_bars": {
-        "cn": ["mootdx", "eastmoney", "baostock"],
+        "cn": ["public", "mootdx"],
         "us": ["yfinance"],
     },
     "xdxr": {
         "cn": ["mootdx"],
     },
     "fundamentals": {
-        "cn": ["mootdx"],
+        "cn": ["public", "mootdx"],
         "us": ["yfinance"],
     },
     "valuation": {
@@ -48,6 +49,9 @@ DEFAULT_ROUTE_TABLE = {
         "cn": ["mootdx"],
     },
     "minute_bars": {
-        "cn": ["mootdx"],
+        "cn": ["public", "mootdx"],
+    },
+    "fund_bars": {
+        "cn": ["public"],
     },
 }

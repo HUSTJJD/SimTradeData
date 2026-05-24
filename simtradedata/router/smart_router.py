@@ -14,6 +14,9 @@ _MARKET_SUFFIXES = {
     "SS": "cn",
     "SZ": "cn",
     "BJ": "cn",
+    "SH": "cn",
+    "XSHG": "cn",
+    "XSHE": "cn",
     "US": "us",
 }
 
@@ -180,6 +183,8 @@ class SmartRouter:
         def fetch_from(fetcher, source_name):
             if source_name == "mootdx":
                 df = fetcher.fetch_daily_data(symbol, start_date, end_date)
+            elif source_name == "public":
+                df = fetcher.fetch_reconciled_daily(symbol, start_date, end_date)
             elif source_name == "eastmoney":
                 df = fetcher.fetch_daily_bars(symbol, start_date, end_date)
             elif source_name == "baostock":
@@ -286,9 +291,31 @@ class SmartRouter:
         """
 
         def fetch_from(fetcher, source_name):
-            return fetcher.fetch_minute_bars(symbol, frequency, offset)
+            df = fetcher.fetch_minute_bars(symbol, frequency, offset)
+            if (
+                source_name == "public"
+                and int(frequency) == 7
+                and df is not None
+                and not df.empty
+            ):
+                from simtradedata.writers.minute_store import append_minute_bars
+
+                return append_minute_bars(symbol, df)
+            return df
 
         return self._try_fetch("minute_bars", fetch_from, symbol=symbol)
+
+    def get_fund_bars(self, symbol, start_date, end_date):
+        """场内基金 / ETF 日线。"""
+
+        def fetch_from(fetcher, source_name):
+            if source_name == "public" and hasattr(fetcher, "fetch_reconciled_daily"):
+                return fetcher.fetch_reconciled_daily(symbol, start_date, end_date)
+            if hasattr(fetcher, "fetch_fund_bars"):
+                return fetcher.fetch_fund_bars(symbol, start_date, end_date)
+            return fetcher.fetch_daily_bars(symbol, start_date, end_date)
+
+        return self._try_fetch("fund_bars", fetch_from, symbol=symbol)
 
     def get_fundamentals(self, symbol=None, year=None, quarter=None):
         """Fetch financial fundamentals.
