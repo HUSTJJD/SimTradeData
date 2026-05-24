@@ -14,6 +14,7 @@ Output: DuckDB database (data/cn.duckdb)
 """
 
 import argparse
+from filelock import FileLock, Timeout
 import logging
 import socket
 import warnings
@@ -68,6 +69,40 @@ def _latest_stock_coverage(
         return 0, 0, 0.0
     latest_count = len(stock_set & current_symbols)
     return latest_count, total, latest_count / total
+
+class ProcessLock:
+    """Process lock to prevent multiple instances from running simultaneously"""
+
+    def __init__(self, lock_file: str):
+        self.lock_file = Path(lock_file)
+        self.lock_file.parent.mkdir(parents=True, exist_ok=True)
+        self.lock_fd = None
+        self.file_lock = FileLock(str(self.lock_file), timeout=-1)
+
+    def __enter__(self):
+        try:
+            self.file_lock.acquire()
+            self.lock_fd = open(self.lock_file, "w")
+            self.lock_fd.write(str(os.getpid()))
+        except Timeout:
+            print("\nError: Another mootdx download process is running")
+            print(f"Lock file: {self.lock_file}")
+            print(f"\nIf no other process is running, delete the lock file:")
+            print(f"  rm {self.lock_file}")
+            sys.exit(1)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.lock_fd:
+            try:
+                self.lock_fd.close()
+                self.file_lock.release()
+            except Exception:
+                pass
+        try:
+            self.lock_file.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 class MootdxDownloader:

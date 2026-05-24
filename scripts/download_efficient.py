@@ -11,10 +11,15 @@ Output: DuckDB database (data/cn.duckdb)
 Export to Parquet: use scripts/export_parquet.py
 """
 
+from filelock import FileLock, Timeout
 import json
 import logging
+import os
+import sys
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
+import concurrent.futures
 
 import baostock as bs
 import pandas as pd
@@ -49,6 +54,41 @@ logging.basicConfig(
     filemode="w",
 )
 logger = logging.getLogger(__name__)
+
+
+class ProcessLock:
+    """Process lock to prevent multiple instances from running simultaneously"""
+
+    def __init__(self, lock_file: str):
+        self.lock_file = Path(lock_file)
+        self.lock_file.parent.mkdir(parents=True, exist_ok=True)
+        self.lock_fd = None
+        self.file_lock = FileLock(str(self.lock_file), timeout=-1)
+
+    def __enter__(self):
+        try:
+            self.file_lock.acquire()
+            self.lock_fd = open(self.lock_file, "w")
+            self.lock_fd.write(str(os.getpid()))
+        except Timeout:
+            print("\nError: Another download process is running")
+            print(f"Lock file: {self.lock_file}")
+            print(f"\nIf no other process is running, delete the lock file:")
+            print(f"  rm {self.lock_file}")
+            sys.exit(1)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.lock_fd:
+            try:
+                self.lock_fd.close()
+                self.file_lock.release()
+            except Exception:
+                pass
+        try:
+            self.lock_file.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 class EfficientBaoStockDownloader:
@@ -663,15 +703,15 @@ def download_all_data(
             if not valuation_only:
                 print("  Trading calendar...")
                 try:
-                    trade_cal = downloader.standard_fetcher.fetch_trade_calendar(
+                        trade_cal = downloader.standard_fetcher.fetch_trade_calendar(
                         start_date_str, end_date_str
-                    )
-                    if not trade_cal.empty:
-                        trade_days = trade_cal[trade_cal["is_trading_day"] == "1"]
-                        trade_days = trade_days.rename(
-                            columns={"calendar_date": "trade_date"}
                         )
-                        downloader.writer.write_trade_days(trade_days)
+                        if not trade_cal.empty:
+                            trade_days = trade_cal[trade_cal["is_trading_day"] == "1"]
+                            trade_days = trade_days.rename(
+                                columns={"calendar_date": "trade_date"}
+                            )
+                            downloader.writer.write_trade_days(trade_days)
                         print(f"    {len(trade_days)} days")
                 except Exception as e:
                     logger.error(f"Failed to download trading calendar: {e}")
@@ -681,12 +721,12 @@ def download_all_data(
                 BENCHMARK_INDEX = BENCHMARK_CONFIG["default_index"]
                 print(f"  Benchmark index ({BENCHMARK_INDEX})...")
                 try:
-                    benchmark_df = downloader.unified_fetcher.fetch_index_data(
+                        benchmark_df = downloader.unified_fetcher.fetch_index_data(
                         BENCHMARK_INDEX, start_date_str, end_date_str
-                    )
-                    if not benchmark_df.empty:
-                        downloader.writer.write_benchmark(benchmark_df)
-                        print(f"    {len(benchmark_df)} days")
+                        )
+                        if not benchmark_df.empty:
+                            downloader.writer.write_benchmark(benchmark_df)
+                            print(f"    {len(benchmark_df)} days")
                 except Exception as e:
                     logger.error(f"Failed to download benchmark: {e}")
 
