@@ -52,7 +52,7 @@ def _cos_sign(
 
     signed_headers = sorted(
         k for k in norm_headers
-        if k in ("host", "content-type", "content-length")
+        if k in ("host", "content-type", "content-length", "x-cos-acl")
     )
     header_list = ";".join(signed_headers)
     header_kv = "&".join(
@@ -93,6 +93,7 @@ def _cos_request(
     secret_key: str,
     data: bytes | None = None,
     content_type: str = "application/octet-stream",
+    public_read: bool = False,
     timeout: int = 120,
 ) -> tuple[int, bytes]:
     """Make an authenticated COS XML API request. Returns (status, body)."""
@@ -106,6 +107,8 @@ def _cos_request(
     }
     if data is not None:
         headers["Content-Length"] = str(len(data))
+    if public_read:
+        headers["x-cos-acl"] = "public-read"
 
     headers["Authorization"] = _cos_sign(secret_id, secret_key, method, path, headers)
 
@@ -131,7 +134,7 @@ def upload_file(
     data = file_path.read_bytes()
     status, body = _cos_request(
         "PUT", bucket, region, key, secret_id, secret_key,
-        data=data, content_type="application/gzip", timeout=600,
+        data=data, content_type="application/gzip", public_read=True, timeout=600,
     )
     if status == 200:
         print("  ✓ Uploaded")
@@ -165,7 +168,7 @@ def _put_releases_json(
     data = json.dumps(releases, ensure_ascii=False, indent=2).encode()
     status, body = _cos_request(
         "PUT", bucket, region, "releases.json", secret_id, secret_key,
-        data=data, content_type="application/json", timeout=30,
+        data=data, content_type="application/json", public_read=True, timeout=30,
     )
     if status == 200:
         print(f"  ✓ releases.json updated ({len(releases)} releases)")
