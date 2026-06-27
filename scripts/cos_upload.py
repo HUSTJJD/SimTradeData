@@ -14,8 +14,9 @@ Usage:
         --bucket my-bucket \
         --region ap-guangzhou
 
-The releases.json stored on COS is compatible with GitHub Releases-style
-download clients, so no download-side code changes are needed.
+The releases.json stored on COS is GitHub Releases-style metadata. Customer
+download flows should access data through an authorized service that returns
+short-lived signed COS URLs.
 """
 
 import argparse
@@ -134,7 +135,7 @@ def upload_file(
     data = file_path.read_bytes()
     status, body = _cos_request(
         "PUT", bucket, region, key, secret_id, secret_key,
-        data=data, content_type="application/gzip", public_read=True, timeout=600,
+        data=data, content_type="application/gzip", public_read=False, timeout=600,
     )
     if status == 200:
         print("  ✓ Uploaded")
@@ -168,7 +169,7 @@ def _put_releases_json(
     data = json.dumps(releases, ensure_ascii=False, indent=2).encode()
     status, body = _cos_request(
         "PUT", bucket, region, "releases.json", secret_id, secret_key,
-        data=data, content_type="application/json", public_read=True, timeout=30,
+        data=data, content_type="application/json", public_read=False, timeout=30,
     )
     if status == 200:
         print(f"  ✓ releases.json updated ({len(releases)} releases)")
