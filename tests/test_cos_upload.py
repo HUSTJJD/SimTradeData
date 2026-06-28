@@ -91,6 +91,10 @@ def test_release_data_prefers_sdk_capable_python_for_cos_upload():
     assert "sys.version_info >= (3, 10)" in source
     assert 'python3 -c "import sys; import qcloud_cos;' in source
     assert 'python3 "$SCRIPT_DIR/cos_upload.py"' in source
+    assert 'archive_dir=$(mktemp -d "/tmp/${tag}.XXXXXX")' in source
+    assert 'local archive="$archive_dir/$archive_name"' in source
+    assert 'local archive="/tmp/${archive_name}"' not in source
+    assert '[[ "$PUBLISH_TARGETS" == "local" || "$PUBLISH_TARGETS" == "cos" || "$PUBLISH_TARGETS" == "all" ]]' in source
 
 
 def test_empty_key_prefix_does_not_create_leading_slash(monkeypatch, tmp_path):

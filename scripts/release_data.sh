@@ -73,8 +73,10 @@ release_market() {
   local version
   version=$(python3 -c "import json; print(json.load(open('$data_manifest'))['version'])")
   local tag="data-${market}-${version}"
-  local archive="/tmp/simtradedata-${market}-${version}.tar.gz"
   local archive_name="${tag}.tar.gz"
+  local archive_dir
+  archive_dir=$(mktemp -d "/tmp/${tag}.XXXXXX")
+  local archive="$archive_dir/$archive_name"
   local local_archive="$LOCAL_RELEASE_DIR/$archive_name"
 
   # 2. Package
@@ -90,8 +92,8 @@ release_market() {
   local github_ok=true
   local cos_ok=true
 
-  # 3a. Local artifact
-  if [[ "$PUBLISH_TARGETS" == "local" ]]; then
+  # 3a. Local artifact / authorized index mirror
+  if [[ "$PUBLISH_TARGETS" == "local" || "$PUBLISH_TARGETS" == "cos" || "$PUBLISH_TARGETS" == "all" ]]; then
     echo ""
     echo "=== Publishing locally ==="
     mkdir -p "$LOCAL_RELEASE_DIR"
@@ -160,7 +162,7 @@ release_market() {
   fi
 
   # 4. Cleanup
-  rm -f "$archive"
+  rm -rf "$archive_dir"
 
   # 5. Summary
   echo ""
