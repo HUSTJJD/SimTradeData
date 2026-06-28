@@ -3,9 +3,9 @@
 """
 Upload release artifacts to Tencent Cloud COS and maintain releases.json index.
 
-This script uses only Python stdlib (no extra dependencies). It uploads a
-tar.gz archive to a COS bucket and atomically updates a releases.json file
-that mimics the GitHub Releases API response format.
+This script uses Tencent's COS SDK for large archive uploads when available,
+then falls back to a stdlib signed PUT. It atomically updates a releases.json
+file that mimics the GitHub Releases API response format.
 
 Usage:
     COS_SECRET_ID=xxx COS_SECRET_KEY=xxx poetry run python scripts/cos_upload.py \
@@ -132,6 +132,11 @@ def upload_file(
     """Upload a file to COS. Returns True on success."""
     file_size_mb = file_path.stat().st_size / 1024 / 1024
     print(f"  Uploading {file_path.name} → cos://{bucket}/{key} ({file_size_mb:.1f} MB) ...")
+
+    sdk_result = _upload_file_with_sdk(bucket, region, key, file_path, secret_id, secret_key)
+    if sdk_result is not None:
+        return sdk_result
+
     data = file_path.read_bytes()
     status, body = _cos_request(
         "PUT", bucket, region, key, secret_id, secret_key,
@@ -144,6 +149,44 @@ def upload_file(
     if body:
         print(f"    {body.decode(errors='replace')[:500]}")
     return False
+
+
+def _upload_file_with_sdk(
+    bucket: str,
+    region: str,
+    key: str,
+    file_path: Path,
+    secret_id: str,
+    secret_key: str,
+) -> bool | None:
+    """Upload with qcloud_cos multipart support when the SDK is installed."""
+    try:
+        from qcloud_cos import CosConfig, CosS3Client
+    except ImportError:
+        return None
+
+    try:
+        config = CosConfig(
+            Region=region,
+            SecretId=secret_id,
+            SecretKey=secret_key,
+            Scheme="https",
+        )
+        client = CosS3Client(config)
+        client.upload_file(
+            Bucket=bucket,
+            Key=key,
+            LocalFilePath=str(file_path),
+            PartSize=16,
+            MAXThread=4,
+            EnableMD5=False,
+        )
+    except Exception as exc:
+        print(f"  ✗ SDK upload failed: {exc}")
+        return False
+
+    print("  ✓ Uploaded")
+    return True
 
 
 def _fetch_releases_json(

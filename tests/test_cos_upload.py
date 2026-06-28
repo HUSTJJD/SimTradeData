@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import importlib.util
+import sys
+import types
 from pathlib import Path
 
 
@@ -23,10 +25,37 @@ def test_upload_file_keeps_cos_object_private_by_default(monkeypatch, tmp_path):
         calls.append({"args": args, "kwargs": kwargs})
         return 200, b""
 
+    monkeypatch.setattr(cos_upload, "_upload_file_with_sdk", lambda *args: None)
     monkeypatch.setattr(cos_upload, "_cos_request", fake_cos_request)
 
     assert cos_upload.upload_file("bucket", "region", "key.tar.gz", archive, "sid", "skey") is True
     assert calls[0]["kwargs"]["public_read"] is False
+
+
+def test_upload_file_uses_sdk_without_public_acl(monkeypatch, tmp_path):
+    cos_upload = _load_cos_upload()
+    archive = tmp_path / "data-cn-2026-06-26.tar.gz"
+    archive.write_bytes(b"archive")
+    calls = []
+
+    class FakeClient:
+        def __init__(self, config):
+            self.config = config
+
+        def upload_file(self, **kwargs):
+            calls.append(kwargs)
+
+    fake_module = types.SimpleNamespace(
+        CosConfig=lambda **kwargs: kwargs,
+        CosS3Client=FakeClient,
+    )
+    monkeypatch.setitem(sys.modules, "qcloud_cos", fake_module)
+
+    assert cos_upload.upload_file("bucket", "region", "key.tar.gz", archive, "sid", "skey") is True
+    assert calls[0]["Bucket"] == "bucket"
+    assert calls[0]["Key"] == "key.tar.gz"
+    assert "ACL" not in calls[0]
+    assert "x-cos-acl" not in calls[0]
 
 
 def test_releases_json_keeps_cos_object_private_by_default(monkeypatch):

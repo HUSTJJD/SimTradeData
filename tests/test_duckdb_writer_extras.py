@@ -415,6 +415,32 @@ class TestExportDelta:
         assert (tmp_path / "fundamentals" / "AAPL.US.parquet").exists()
         assert (tmp_path / "exrights" / "AAPL.US.parquet").exists()
 
+    def test_full_export_skips_valuation_symbol_without_stock_match(self, tmp_path):
+        market_df = pd.DataFrame({
+            "date": pd.to_datetime(["2026-06-22"]),
+            "open": [10.0],
+            "close": [10.5],
+            "high": [10.8],
+            "low": [9.9],
+            "preclose": [9.8],
+            "volume": [1000],
+            "money": [10500.0],
+        })
+        valuation_df = pd.DataFrame({
+            "date": pd.to_datetime(["2026-06-22"]),
+            "pe_ttm": [12.0],
+            "pb": [1.5],
+        })
+
+        self.writer.write_market_data("000001.SZ", market_df)
+        self.writer.write_valuation("000001.SZ", valuation_df)
+        self.writer.write_valuation("000002.SZ", valuation_df)
+
+        self.writer.export_to_parquet(str(tmp_path), market="cn")
+
+        assert (tmp_path / "valuation" / "000001.SZ.parquet").exists()
+        assert not (tmp_path / "valuation" / "000002.SZ.parquet").exists()
+
     def test_export_delta_exrights_can_rebuild_changed_factors(self, tmp_path):
         base_dir = tmp_path / "base" / "exrights"
         target_dir = tmp_path / "target" / "exrights"
