@@ -166,19 +166,24 @@ def _upload_file_with_sdk(
         return None
 
     try:
+        part_size_mb = int(os.environ.get("COS_UPLOAD_PART_SIZE_MB", "64"))
+        max_threads = int(os.environ.get("COS_UPLOAD_THREADS", "1"))
         config = CosConfig(
             Region=region,
             SecretId=secret_id,
             SecretKey=secret_key,
             Scheme="https",
+            Timeout=int(os.environ.get("COS_UPLOAD_TIMEOUT_SECONDS", "600")),
+            PoolConnections=max_threads,
+            PoolMaxSize=max_threads,
         )
         client = CosS3Client(config)
         client.upload_file(
             Bucket=bucket,
             Key=key,
             LocalFilePath=str(file_path),
-            PartSize=16,
-            MAXThread=4,
+            PartSize=part_size_mb,
+            MAXThread=max_threads,
             EnableMD5=False,
         )
     except Exception as exc:
@@ -331,7 +336,8 @@ def main():
 
     tag = f"data-{market.lower()}-{version}"
 
-    cos_key = f"{args.key_prefix.strip('/')}/{file_path.name}"
+    key_prefix = args.key_prefix.strip("/")
+    cos_key = f"{key_prefix}/{file_path.name}" if key_prefix else file_path.name
 
     print(f"COS Upload: {_cos_host(args.bucket, args.region)}")
     print(f"  Tag:  {tag}")
