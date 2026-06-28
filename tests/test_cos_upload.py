@@ -70,3 +70,13 @@ def test_releases_json_keeps_cos_object_private_by_default(monkeypatch):
 
     assert cos_upload._put_releases_json("bucket", "region", [], "sid", "skey") is True
     assert calls[0]["kwargs"]["public_read"] is False
+
+
+def test_release_data_prefers_sdk_capable_python_for_cos_upload():
+    release_script = Path(__file__).resolve().parents[1] / "scripts" / "release_data.sh"
+    source = release_script.read_text()
+
+    assert "COS_UPLOAD_PYTHON" in source
+    assert "sys.version_info >= (3, 10)" in source
+    assert 'python3 -c "import sys; import qcloud_cos;' in source
+    assert 'python3 "$SCRIPT_DIR/cos_upload.py"' in source

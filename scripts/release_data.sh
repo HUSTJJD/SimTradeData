@@ -134,12 +134,28 @@ release_market() {
       echo "  ERROR: --cos-region or COS_REGION env var required for COS publish"
       cos_ok=false
     else
-      poetry run python "$SCRIPT_DIR/cos_upload.py" \
-        --file "$archive" \
-        --data-manifest "$data_manifest" \
-        --bucket "$COS_BUCKET" \
-        --region "$COS_REGION" \
-        --key-prefix "$COS_KEY_PREFIX" || cos_ok=false
+      if [[ -n "${COS_UPLOAD_PYTHON:-}" ]]; then
+        "$COS_UPLOAD_PYTHON" "$SCRIPT_DIR/cos_upload.py" \
+          --file "$archive" \
+          --data-manifest "$data_manifest" \
+          --bucket "$COS_BUCKET" \
+          --region "$COS_REGION" \
+          --key-prefix "$COS_KEY_PREFIX" || cos_ok=false
+      elif command -v python3 >/dev/null 2>&1 && python3 -c "import sys; import qcloud_cos; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)" >/dev/null 2>&1; then
+        python3 "$SCRIPT_DIR/cos_upload.py" \
+          --file "$archive" \
+          --data-manifest "$data_manifest" \
+          --bucket "$COS_BUCKET" \
+          --region "$COS_REGION" \
+          --key-prefix "$COS_KEY_PREFIX" || cos_ok=false
+      else
+        poetry run python "$SCRIPT_DIR/cos_upload.py" \
+          --file "$archive" \
+          --data-manifest "$data_manifest" \
+          --bucket "$COS_BUCKET" \
+          --region "$COS_REGION" \
+          --key-prefix "$COS_KEY_PREFIX" || cos_ok=false
+      fi
     fi
   fi
 
