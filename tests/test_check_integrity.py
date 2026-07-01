@@ -355,3 +355,13 @@ def test_daily_integrity_gates_use_market_duckdb_path():
 
     assert 'DUCKDB_FILE="$SIMTRADE_DATA_DIR/data/${MARKET}.duckdb"' in script
     assert script.count('--db-path "$DUCKDB_FILE"') == 2
+
+
+def test_daily_pipeline_publishes_when_local_release_lags_db_version():
+    script = Path("scripts/run_daily.sh").read_text(encoding="utf-8")
+
+    assert "TRACK_LOCAL_RELEASE_VERSION" in script
+    assert "get_released_version" in script
+    assert 'OLD_RELEASE_VERSION=$(get_released_version "$MARKET")' in script
+    assert '"$OLD_RELEASE_VERSION" != "$NEW_VERSION"' in script
+    assert "continuing to integrity gate and release" in script

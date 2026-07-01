@@ -94,6 +94,10 @@ cleanup_logs() {
   find "$LOG_DIR" -name "*.log" -mtime "+$LOG_RETENTION_DAYS" -delete 2>/dev/null || true
 }
 
+tracks_local_release_version() {
+  [[ "$PUBLISH_TARGETS" == "local" || "$PUBLISH_TARGETS" == "cos" || "$PUBLISH_TARGETS" == "all" ]]
+}
+
 run_download() {
   if [[ "$MARKET" == "us" ]]; then
     poetry run python scripts/download_us.py
@@ -126,6 +130,26 @@ finally:
 "
 }
 
+get_released_version() {
+  local market="$1"
+  local release_dir="${LOCAL_RELEASE_DIR:-$SIMTRADE_DATA_DIR/data/releases}"
+  local latest=""
+  local file base version
+
+  shopt -s nullglob
+  for file in "$release_dir"/data-"$market"-*.tar.gz; do
+    base="$(basename "$file")"
+    version="${base#data-$market-}"
+    version="${version%.tar.gz}"
+    if [[ -z "$latest" || "$version" > "$latest" ]]; then
+      latest="$version"
+    fi
+  done
+  shopt -u nullglob
+
+  printf '%s\n' "$latest"
+}
+
 # ── Main pipeline ───────────────────────────────────────────────────
 log "=== SimTradeData Daily Pipeline Start ==="
 log "  Market:          $MARKET"
@@ -141,6 +165,13 @@ cd "$SIMTRADE_DATA_DIR"
 # 1. Snapshot version before download
 OLD_VERSION=$(get_version "$MARKET")
 log "Version before download: ${OLD_VERSION:-none}"
+TRACK_LOCAL_RELEASE_VERSION=0
+OLD_RELEASE_VERSION=""
+if tracks_local_release_version; then
+  TRACK_LOCAL_RELEASE_VERSION=1
+  OLD_RELEASE_VERSION=$(get_released_version "$MARKET")
+  log "Latest local release: ${OLD_RELEASE_VERSION:-none}"
+fi
 
 # 2. Run download with retry. BaoStock and other free sources can publish late;
 # retry both hard failures and successful runs that do not advance the version.
@@ -185,13 +216,17 @@ if [[ "$DOWNLOAD_RC" -ne 0 ]]; then
 fi
 
 if [[ "$OLD_VERSION" == "$NEW_VERSION" ]]; then
-  log "No new data after ${DOWNLOAD_ATTEMPTS} attempts (version unchanged: $NEW_VERSION). Skipping release."
-  log "=== Pipeline Complete (no-op) ==="
-  cleanup_logs
-  exit 0
+  if [[ "$TRACK_LOCAL_RELEASE_VERSION" == "1" && "$OLD_RELEASE_VERSION" != "$NEW_VERSION" ]]; then
+    log "Data version unchanged ($NEW_VERSION), but local release is ${OLD_RELEASE_VERSION:-none}; continuing to integrity gate and release."
+  else
+    log "No new data after ${DOWNLOAD_ATTEMPTS} attempts (version unchanged: $NEW_VERSION). Skipping release."
+    log "=== Pipeline Complete (no-op) ==="
+    cleanup_logs
+    exit 0
+  fi
+else
+  log "New data detected: ${OLD_VERSION:-none} → $NEW_VERSION"
 fi
-
-log "New data detected: ${OLD_VERSION:-none} → $NEW_VERSION"
 
 # 4. Pre-release integrity gate: DB must be complete before exporting.
 if [[ "$INTEGRITY_STRICT" == "1" ]]; then

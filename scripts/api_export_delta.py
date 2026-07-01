@@ -11,6 +11,7 @@ from pathlib import Path
 
 import duckdb
 
+from check_integrity import _halted_symbols_on, _stock_universe
 from export_parquet import _resolve_db
 
 
@@ -40,6 +41,74 @@ def _latest_stock_date(conn: duckdb.DuckDBPyConnection) -> dt.date:
     if isinstance(value, dt.datetime):
         return value.date()
     return value
+
+
+def _count_symbols_on_date(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    table: str,
+    symbols: list[str],
+    date_value: dt.date,
+) -> int:
+    if not symbols:
+        return 0
+    placeholders = ",".join(["?"] * len(symbols))
+    return conn.execute(
+        f"""
+        SELECT COUNT(DISTINCT symbol)
+        FROM {table}
+        WHERE date = ? AND symbol IN ({placeholders})
+        """,
+        [date_value, *symbols],
+    ).fetchone()[0]
+
+
+def _latest_complete_date(conn: duckdb.DuckDBPyConnection, market: str) -> dt.date | None:
+    latest = _latest_stock_date(conn)
+    if market != "cn":
+        return latest
+
+    recent_dates = conn.execute(
+        """
+        SELECT date
+        FROM stocks
+        GROUP BY date
+        ORDER BY date DESC
+        LIMIT 60
+        """
+    ).fetchall()
+
+    for (candidate,) in recent_dates:
+        candidate_date = candidate.date() if isinstance(candidate, dt.datetime) else candidate
+        candidate_text = candidate_date.isoformat()
+        active_symbols, _ = _stock_universe(conn, market, candidate_text)
+        halted_symbols = _halted_symbols_on(conn, candidate_text)
+        required_symbols = [
+            symbol for symbol in active_symbols if symbol not in halted_symbols
+        ]
+        if not required_symbols:
+            return candidate_date
+
+        expected = len(required_symbols)
+        if (
+            _count_symbols_on_date(
+                conn,
+                table="stocks",
+                symbols=required_symbols,
+                date_value=candidate_date,
+            )
+            == expected
+            and _count_symbols_on_date(
+                conn,
+                table="valuation",
+                symbols=required_symbols,
+                date_value=candidate_date,
+            )
+            == expected
+        ):
+            return candidate_date
+
+    return None
 
 
 def _copy_table(
@@ -81,6 +150,27 @@ def _write_manifest_archive(output: Path, manifest: dict) -> None:
         _write_archive(output, package_dir, ["manifest.json"])
 
 
+def _write_busy_manifest_archive(
+    output: Path,
+    *,
+    market: str,
+    last_sync: dt.date,
+    retry_after: int,
+) -> None:
+    _write_manifest_archive(output, {
+        "package_format": "simtradedata_api_delta_v1",
+        "schema_version": 1,
+        "market": market,
+        "from_version": last_sync.isoformat(),
+        "to_version": None,
+        "up_to_date": False,
+        "fallback_to_baseline": False,
+        "pipeline_busy": True,
+        "retry_after": retry_after,
+        "tables": [],
+    })
+
+
 def export_api_delta(
     *,
     market: str,
@@ -99,22 +189,25 @@ def export_api_delta(
         message = str(exc)
         if "Could not set lock" not in message and "Conflicting lock" not in message:
             raise
-        _write_manifest_archive(output, {
-            "package_format": "simtradedata_api_delta_v1",
-            "schema_version": 1,
-            "market": market,
-            "from_version": last_sync.isoformat(),
-            "to_version": None,
-            "up_to_date": False,
-            "fallback_to_baseline": False,
-            "pipeline_busy": True,
-            "retry_after": retry_after,
-            "tables": [],
-        })
+        _write_busy_manifest_archive(
+            output,
+            market=market,
+            last_sync=last_sync,
+            retry_after=retry_after,
+        )
         return
 
     with conn:
-        latest = _latest_stock_date(conn)
+        latest = _latest_complete_date(conn, market)
+        if latest is None:
+            _write_busy_manifest_archive(
+                output,
+                market=market,
+                last_sync=last_sync,
+                retry_after=retry_after,
+            )
+            return
+
         base_manifest = {
             "package_format": "simtradedata_api_delta_v1",
             "schema_version": 1,

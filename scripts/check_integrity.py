@@ -64,6 +64,13 @@ def _is_active(de_listed_date: Any, target_date: str) -> bool:
     return text > target_date
 
 
+def _is_listed(listed_date: Any, target_date: str) -> bool:
+    text = _date_text(listed_date)
+    if not text or text.lower() in {"none", "null", "nat"}:
+        return True
+    return text <= target_date
+
+
 def _is_delisted_name(stock_name: Any) -> bool:
     if stock_name is None:
         return False
@@ -155,19 +162,23 @@ def _active_cn_symbols(
             "security_type" if "security_type" in metadata_columns else "NULL"
         )
         stock_name_expr = "stock_name" if "stock_name" in metadata_columns else "NULL"
+        listed_date_expr = "listed_date" if "listed_date" in metadata_columns else "NULL"
         rows = conn.execute(
             f"""
-            SELECT symbol, de_listed_date, {security_type_expr} AS security_type,
+            SELECT symbol, {listed_date_expr} AS listed_date, de_listed_date,
+                   {security_type_expr} AS security_type,
                    {stock_name_expr} AS stock_name
             FROM stock_metadata
             ORDER BY symbol
             """
         ).fetchall()
-        has_security_type = any(row[2] not in (None, "") for row in rows)
+        has_security_type = any(row[3] not in (None, "") for row in rows)
 
         symbols = []
         anomalies = []
-        for symbol, de_listed_date, security_type, stock_name in rows:
+        for symbol, listed_date, de_listed_date, security_type, stock_name in rows:
+            if not _is_listed(listed_date, target_date):
+                continue
             if not _is_active(de_listed_date, target_date):
                 continue
             if _is_delisted_name(stock_name):
