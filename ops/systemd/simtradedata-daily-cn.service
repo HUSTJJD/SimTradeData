@@ -10,7 +10,7 @@ EnvironmentFile=-/etc/simtradedata.env
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=MARKET=cn
 Environment=PUBLISH_TARGETS=local
-Environment=DOWNLOAD_ATTEMPTS=1
+Environment=DOWNLOAD_ATTEMPTS=3
 Environment=RETRY_INTERVAL_SECONDS=1800
 Environment=INTEGRITY_STRICT=1
 ExecStart=/usr/bin/bash -lc 'cd "$${SIMTRADE_DATA_DIR:?Set SIMTRADE_DATA_DIR in /etc/simtradedata.env}" && exec bash scripts/run_daily.sh'

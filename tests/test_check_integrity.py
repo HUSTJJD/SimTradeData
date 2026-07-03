@@ -1,4 +1,6 @@
 import json
+import os
+import subprocess
 from pathlib import Path
 
 import duckdb
@@ -365,3 +367,112 @@ def test_daily_pipeline_publishes_when_local_release_lags_db_version():
     assert 'OLD_RELEASE_VERSION=$(get_released_version "$MARKET")' in script
     assert '"$OLD_RELEASE_VERSION" != "$NEW_VERSION"' in script
     assert "continuing to integrity gate and release" in script
+
+
+def test_daily_pipeline_retries_pre_release_integrity_failures():
+    script = Path("scripts/run_daily.sh").read_text(encoding="utf-8")
+    service = Path("ops/systemd/simtradedata-daily-cn.service").read_text(encoding="utf-8")
+
+    assert "run_pre_release_integrity()" in script
+    assert "PRE_RELEASE_INTEGRITY_OK=1" in script
+    assert "Pre-release integrity failed on attempt" in script
+    assert "pre-release integrity gate failed after ${DOWNLOAD_ATTEMPTS} attempts" in script
+    assert "Environment=DOWNLOAD_ATTEMPTS=3" in service
+
+
+def test_daily_pipeline_waits_until_final_attempt_before_lagging_local_release(
+    tmp_path,
+):
+    project_dir = tmp_path / "project"
+    release_dir = project_dir / "data" / "releases"
+    release_dir.mkdir(parents=True)
+    (release_dir / "data-cn-2026-06-23.tar.gz").write_bytes(b"")
+    scripts_dir = project_dir / "scripts"
+    scripts_dir.mkdir()
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    attempts_file = tmp_path / "download_attempts"
+    release_attempt_file = tmp_path / "release_attempt"
+
+    fake_poetry = fake_bin / "poetry"
+    fake_poetry.write_text(
+        """#!/bin/bash
+set -euo pipefail
+
+if [[ "${1:-}" == "run" && "${2:-}" == "python" && "${3:-}" == "-c" ]]; then
+  printf '%s\\n' "${SIMTRADE_TEST_VERSION:?}"
+  exit 0
+fi
+
+if [[ "${1:-}" == "run" && "${2:-}" == "python" && "${3:-}" == "scripts/download.py" ]]; then
+  attempts=0
+  if [[ -f "${SIMTRADE_TEST_ATTEMPTS:?}" ]]; then
+    attempts="$(cat "$SIMTRADE_TEST_ATTEMPTS")"
+  fi
+  attempts=$((attempts + 1))
+  printf '%s\\n' "$attempts" >"$SIMTRADE_TEST_ATTEMPTS"
+  exit 0
+fi
+
+if [[ "${1:-}" == "run" && "${2:-}" == "python" && "${3:-}" == "scripts/check_integrity.py" ]]; then
+  exit 0
+fi
+
+echo "unexpected poetry command: $*" >&2
+exit 127
+""",
+        encoding="utf-8",
+    )
+    fake_poetry.chmod(0o755)
+
+    release_script = scripts_dir / "release_data.sh"
+    release_script.write_text(
+        """#!/bin/bash
+set -euo pipefail
+
+attempts=0
+if [[ -f "${SIMTRADE_TEST_ATTEMPTS:?}" ]]; then
+  attempts="$(cat "$SIMTRADE_TEST_ATTEMPTS")"
+fi
+printf '%s\\n' "$attempts" >"${SIMTRADE_TEST_RELEASE_ATTEMPT:?}"
+
+manifest_dir="${SIMTRADE_DATA_DIR:?}/data/export/${MARKET:?}"
+mkdir -p "$manifest_dir"
+printf '{"version":"%s"}\\n' "${SIMTRADE_TEST_VERSION:?}" >"$manifest_dir/manifest.json"
+""",
+        encoding="utf-8",
+    )
+    release_script.chmod(0o755)
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "DOWNLOAD_ATTEMPTS": "3",
+            "INTEGRITY_STRICT": "1",
+            "LOCK_FILE": str(tmp_path / "daily.lock"),
+            "LOG_DIR": str(tmp_path / "logs"),
+            "MARKET": "cn",
+            "PATH": f"{fake_bin}:{env['PATH']}",
+            "PUBLISH_TARGETS": "local",
+            "RETRY_INTERVAL_SECONDS": "0",
+            "SIMTRADE_DATA_DIR": str(project_dir),
+            "SIMTRADE_TEST_ATTEMPTS": str(attempts_file),
+            "SIMTRADE_TEST_RELEASE_ATTEMPT": str(release_attempt_file),
+            "SIMTRADE_TEST_VERSION": "2026-06-24",
+        }
+    )
+
+    result = subprocess.run(
+        ["/bin/bash", str(Path("scripts/run_daily.sh").resolve())],
+        check=False,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stdout
+    assert attempts_file.read_text(encoding="utf-8").strip() == "3"
+    assert release_attempt_file.read_text(encoding="utf-8").strip() == "3"

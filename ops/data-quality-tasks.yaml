@@ -8,7 +8,7 @@ tasks:
     trigger: systemd timer
     systemd_timer: simtradedata-daily-cn.timer
     systemd_service: simtradedata-daily-cn.service
-    command: cd "$SIMTRADE_DATA_DIR" && MARKET=cn PUBLISH_TARGETS=local DOWNLOAD_ATTEMPTS=1 INTEGRITY_STRICT=1 bash scripts/run_daily.sh
+    command: cd "$SIMTRADE_DATA_DIR" && MARKET=cn PUBLISH_TARGETS=local DOWNLOAD_ATTEMPTS=3 INTEGRITY_STRICT=1 bash scripts/run_daily.sh
     working_directory: $SIMTRADE_DATA_DIR
     logs: $SIMTRADE_DATA_DIR/logs/daily
     may_contact_baostock: true

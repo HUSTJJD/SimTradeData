@@ -37,7 +37,7 @@ Service environment should explicitly set:
 SIMTRADE_DATA_DIR=/path/to/SimTradeData
 MARKET=cn
 PUBLISH_TARGETS=local
-DOWNLOAD_ATTEMPTS=1
+DOWNLOAD_ATTEMPTS=3
 INTEGRITY_STRICT=1
 ```
 
@@ -62,7 +62,7 @@ but should be enabled only after runtime and data-source pressure are acceptable
 Command from `ops/data-quality-tasks.yaml`:
 
 ```bash
-MARKET=cn PUBLISH_TARGETS=local DOWNLOAD_ATTEMPTS=1 INTEGRITY_STRICT=1 bash scripts/run_daily.sh
+MARKET=cn PUBLISH_TARGETS=local DOWNLOAD_ATTEMPTS=3 INTEGRITY_STRICT=1 bash scripts/run_daily.sh
 ```
 
 Before publishing, the job must pass:
@@ -100,7 +100,7 @@ poetry run python scripts/check_integrity.py --market cn --strict --json-output 
 
 - Daily job failure: do not publish; inspect latest `logs/daily/*.log` and
   integrity JSON.
-- BaoStock-related failure: do not loop retries; wait for the next schedule or
-  run a bounded manual repair.
+- BaoStock-related failure: rely on the bounded daily attempts first; if all
+  attempts fail, wait for the next schedule or run a bounded manual repair.
 - Bad published data: move manifest/latest pointer back to the previous version
   and keep logs for diagnosis.

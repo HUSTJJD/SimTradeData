@@ -428,13 +428,13 @@ poetry run python scripts/export_parquet.py --delta --base-version 2026-06-20 --
 Step 1 imports the latest TDX daily package, skips Mootdx OHLCV after that fast path, and refreshes the remaining Mootdx/BaoStock datasets. When there are no new trading days, existing rows are skipped quickly.
 Delta export contains changed symbol-table rows and a manifest for the requested version window. First install, periodic reconciliation, and failed delta recovery still use the full Parquet export.
 
-For production scheduling, run the daily script later in the trading day (for example after 22:30). It uses the same TDX-backed fast path by default. The default is one download attempt plus pre/post release integrity gates, so transient upstream delays do not trigger repeated requests automatically:
+For production scheduling, run the daily script later in the trading day (for example after 22:30). It uses the same TDX-backed fast path by default. The recommended production setting is three bounded attempts, each covering download plus pre-release integrity, so transient upstream delays can recover without publishing incomplete data:
 
 ```bash
-DOWNLOAD_ATTEMPTS=1 INTEGRITY_STRICT=1 bash scripts/run_daily.sh
+DOWNLOAD_ATTEMPTS=3 INTEGRITY_STRICT=1 bash scripts/run_daily.sh
 ```
 
-The integrity gate verifies that active stocks have latest market and valuation data, validates the exported manifest, and writes JSON reports under `logs/daily/`. If a source is late, let the scheduler run again later instead of looping retries.
+The integrity gate verifies that active stocks have latest market and valuation data, validates the exported manifest, and writes JSON reports under `logs/daily/`. If all bounded attempts fail, keep the last known-good release and inspect the latest log or alert before running manual recovery.
 
 ### Data Quality
 - Data sourced from BaoStock free data service

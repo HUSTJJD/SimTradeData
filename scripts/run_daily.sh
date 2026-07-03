@@ -17,7 +17,7 @@
 #   LOCK_FILE           Path to lock file (default: /tmp/simtradedata_daily.lock)
 #   LOG_DIR             Directory for run logs (default: logs/daily)
 #   LOG_RETENTION_DAYS  Days to keep logs (default: 30)
-#   DOWNLOAD_ATTEMPTS   Download attempts before giving up/no-op (default: 1)
+#   DOWNLOAD_ATTEMPTS   Download + pre-release integrity attempts before giving up/no-op (default: 1)
 #   RETRY_INTERVAL_SECONDS Seconds between download retries (default: 1800)
 #   INTEGRITY_STRICT    Run integrity gates before/after release (default: 1)
 
@@ -106,6 +106,26 @@ run_download() {
   fi
 }
 
+run_pre_release_integrity() {
+  if [[ "$INTEGRITY_STRICT" != "1" ]]; then
+    return 0
+  fi
+
+  PRE_RELEASE_INTEGRITY_REPORT="$LOG_DIR/$(date +%Y%m%d_%H%M%S)_${MARKET}_pre_release_integrity.json"
+  log "--- Running pre-release integrity gate ---"
+  if poetry run python scripts/check_integrity.py \
+    --db-path "$DUCKDB_FILE" \
+    --market "$MARKET" \
+    --target-date "$NEW_VERSION" \
+    --json-output "$PRE_RELEASE_INTEGRITY_REPORT" \
+    --strict; then
+    log "Pre-release integrity verified: $PRE_RELEASE_INTEGRITY_REPORT"
+    return 0
+  fi
+
+  return 1
+}
+
 # ── Determine DuckDB path by market ─────────────────────────────────
 get_version() {
   local market="$1"
@@ -174,9 +194,11 @@ if tracks_local_release_version; then
 fi
 
 # 2. Run download with retry. BaoStock and other free sources can publish late;
-# retry both hard failures and successful runs that do not advance the version.
+# retry hard failures, unchanged versions, and incomplete pre-release integrity.
 NEW_VERSION=""
 DOWNLOAD_RC=0
+PRE_RELEASE_INTEGRITY_OK=0
+PRE_RELEASE_INTEGRITY_REPORT=""
 for attempt in $(seq 1 "$DOWNLOAD_ATTEMPTS"); do
   log "--- Running download attempt ${attempt}/${DOWNLOAD_ATTEMPTS} ---"
   if run_download; then
@@ -188,7 +210,21 @@ for attempt in $(seq 1 "$DOWNLOAD_ATTEMPTS"); do
       DOWNLOAD_RC=1
       log "No data in stocks table after download"
     elif [[ "$OLD_VERSION" != "$NEW_VERSION" ]]; then
-      break
+      log "New data detected: ${OLD_VERSION:-none} → $NEW_VERSION"
+      if run_pre_release_integrity; then
+        PRE_RELEASE_INTEGRITY_OK=1
+        break
+      fi
+      DOWNLOAD_RC=1
+      log "Pre-release integrity failed on attempt ${attempt}/${DOWNLOAD_ATTEMPTS}"
+    elif [[ "$TRACK_LOCAL_RELEASE_VERSION" == "1" && "$OLD_RELEASE_VERSION" != "$NEW_VERSION" && "$attempt" -eq "$DOWNLOAD_ATTEMPTS" ]]; then
+      log "Data version unchanged ($NEW_VERSION), but local release is ${OLD_RELEASE_VERSION:-none}; final attempt reached, continuing to integrity gate and release."
+      if run_pre_release_integrity; then
+        PRE_RELEASE_INTEGRITY_OK=1
+        break
+      fi
+      DOWNLOAD_RC=1
+      log "Pre-release integrity failed on attempt ${attempt}/${DOWNLOAD_ATTEMPTS}"
     else
       log "No new data yet (version unchanged: $NEW_VERSION)"
     fi
@@ -210,39 +246,21 @@ if [[ -z "$NEW_VERSION" ]]; then
 fi
 
 if [[ "$DOWNLOAD_RC" -ne 0 ]]; then
+  if [[ -n "$PRE_RELEASE_INTEGRITY_REPORT" ]]; then
+    alert "pre-release integrity gate failed after ${DOWNLOAD_ATTEMPTS} attempts (last report: $PRE_RELEASE_INTEGRITY_REPORT)"
+    cleanup_logs
+    exit 1
+  fi
   alert "download failed after ${DOWNLOAD_ATTEMPTS} attempts (last exit code: ${DOWNLOAD_RC})"
   cleanup_logs
   exit "$DOWNLOAD_RC"
 fi
 
-if [[ "$OLD_VERSION" == "$NEW_VERSION" ]]; then
-  if [[ "$TRACK_LOCAL_RELEASE_VERSION" == "1" && "$OLD_RELEASE_VERSION" != "$NEW_VERSION" ]]; then
-    log "Data version unchanged ($NEW_VERSION), but local release is ${OLD_RELEASE_VERSION:-none}; continuing to integrity gate and release."
-  else
-    log "No new data after ${DOWNLOAD_ATTEMPTS} attempts (version unchanged: $NEW_VERSION). Skipping release."
-    log "=== Pipeline Complete (no-op) ==="
-    cleanup_logs
-    exit 0
-  fi
-else
-  log "New data detected: ${OLD_VERSION:-none} → $NEW_VERSION"
-fi
-
-# 4. Pre-release integrity gate: DB must be complete before exporting.
-if [[ "$INTEGRITY_STRICT" == "1" ]]; then
-  INTEGRITY_REPORT="$LOG_DIR/$(date +%Y%m%d_%H%M%S)_${MARKET}_pre_release_integrity.json"
-  log "--- Running pre-release integrity gate ---"
-  if ! poetry run python scripts/check_integrity.py \
-    --db-path "$DUCKDB_FILE" \
-    --market "$MARKET" \
-    --target-date "$NEW_VERSION" \
-    --json-output "$INTEGRITY_REPORT" \
-    --strict; then
-    alert "pre-release integrity gate failed (report: $INTEGRITY_REPORT)"
-    cleanup_logs
-    exit 1
-  fi
-  log "Pre-release integrity verified: $INTEGRITY_REPORT"
+if [[ "$PRE_RELEASE_INTEGRITY_OK" != "1" ]]; then
+  log "No new data after ${DOWNLOAD_ATTEMPTS} attempts (version unchanged: $NEW_VERSION). Skipping release."
+  log "=== Pipeline Complete (no-op) ==="
+  cleanup_logs
+  exit 0
 fi
 
 # 5. Run release pipeline (export + package + publish)
