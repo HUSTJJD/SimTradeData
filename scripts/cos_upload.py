@@ -20,10 +20,12 @@ short-lived signed COS URLs.
 """
 
 import argparse
+import datetime as dt
 import hashlib
 import hmac
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -195,7 +197,12 @@ def _upload_file_with_sdk(
 
 
 def _fetch_releases_json(
-    bucket: str, region: str, secret_id: str, secret_key: str
+    bucket: str,
+    region: str,
+    secret_id: str,
+    secret_key: str,
+    *,
+    strict: bool = False,
 ) -> list[dict]:
     """Download releases.json from COS. Returns empty list if not found."""
     status, body = _cos_request(
@@ -206,6 +213,8 @@ def _fetch_releases_json(
         return json.loads(body.decode())
     if status == 404:
         return []
+    if strict:
+        raise RuntimeError(f"failed to fetch releases.json (HTTP {status})")
     print(f"  Warning: failed to fetch releases.json (HTTP {status})")
     return []
 
@@ -226,6 +235,57 @@ def _put_releases_json(
     return False
 
 
+def _release_metadata(data_manifest: dict) -> tuple[str, dict]:
+    market = data_manifest.get("market", "")
+    if data_manifest.get("package_format") == "simtradedata_api_delta_v1":
+        base_version = data_manifest.get("from_version", "")
+        target_version = data_manifest.get("to_version", "")
+        tag = (
+            f"data-{market.lower()}-{base_version}-to-{target_version}-delta"
+        )
+        return tag, {
+            "release_type": "delta",
+            "market": market.upper(),
+            "base_version": base_version,
+            "target_version": target_version,
+        }
+
+    target_version = data_manifest.get("version", "")
+    return f"data-{market.lower()}-{target_version}", {
+        "release_type": "baseline",
+        "market": market.upper(),
+        "target_version": target_version,
+    }
+
+
+def _latest_published_version(releases: list[dict], market: str) -> str:
+    """Return the latest valid target version published for a market."""
+    normalized_market = market.lower()
+    legacy_tag = re.compile(
+        rf"^data-{re.escape(normalized_market)}-(\d{{4}}-\d{{2}}-\d{{2}})$"
+    )
+    versions = []
+
+    for release in releases:
+        release_market = str(release.get("market", "")).lower()
+        target_version = release.get("target_version")
+        if release_market == normalized_market and isinstance(target_version, str):
+            candidate = target_version
+        else:
+            match = legacy_tag.fullmatch(str(release.get("tag_name", "")))
+            if not match:
+                continue
+            candidate = match.group(1)
+
+        try:
+            dt.date.fromisoformat(candidate)
+        except ValueError:
+            continue
+        versions.append(candidate)
+
+    return max(versions, default="")
+
+
 def _build_release_entry(
     data_manifest: dict, archive_path: Path, archive_size: int,
     tag: str, bucket: str, region: str, cos_key: str,
@@ -235,7 +295,8 @@ def _build_release_entry(
 
     # Brief release body
     market = data_manifest.get("market", "")
-    version = data_manifest.get("version", "")
+    _, release_metadata = _release_metadata(data_manifest)
+    version = release_metadata["target_version"]
     date_range = data_manifest.get("date_range", {})
     body_lines = [
         f"Market: {market}",
@@ -245,6 +306,7 @@ def _build_release_entry(
     ]
 
     return {
+        **release_metadata,
         "tag_name": tag,
         "name": f"SimTradeData {market} {version}",
         "body": "\n".join(body_lines),
@@ -273,7 +335,13 @@ def _update_releases_index(
 
     Returns True on success.
     """
-    releases = _fetch_releases_json(bucket, region, secret_id, secret_key)
+    try:
+        releases = _fetch_releases_json(
+            bucket, region, secret_id, secret_key, strict=True
+        )
+    except (RuntimeError, json.JSONDecodeError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return False
 
     # Remove existing entry for this tag (idempotent re-upload)
     releases = [r for r in releases if r.get("tag_name") != tag]
@@ -294,13 +362,30 @@ def main():
     parser = argparse.ArgumentParser(
         description="Upload release artifacts to Tencent COS"
     )
-    parser.add_argument("--file", required=True, help="tar.gz archive to upload")
+    parser.add_argument("--file", help="tar.gz archive to upload")
     parser.add_argument(
-        "--data-manifest", required=True,
+        "--data-manifest",
         help="Data manifest.json from export_parquet.py output directory",
     )
     parser.add_argument("--bucket", required=True, help="COS bucket name")
     parser.add_argument("--region", required=True, help="COS region (e.g. ap-guangzhou)")
+    parser.add_argument("--market", choices=["cn", "us"])
+    parser.add_argument(
+        "--print-latest-version",
+        action="store_true",
+        help="Print the latest published target version for --market",
+    )
+    phase_group = parser.add_mutually_exclusive_group()
+    phase_group.add_argument(
+        "--skip-index",
+        action="store_true",
+        help="Upload the archive without updating releases.json",
+    )
+    phase_group.add_argument(
+        "--index-only",
+        action="store_true",
+        help="Update releases.json without uploading the archive",
+    )
     parser.add_argument(
         "--key-prefix", default="",
         help="COS key prefix / directory (e.g. 'data/')",
@@ -317,6 +402,26 @@ def main():
         print("ERROR: COS_SECRET_ID and COS_SECRET_KEY environment variables required")
         sys.exit(1)
 
+    if args.print_latest_version:
+        if not args.market:
+            parser.error("--market is required with --print-latest-version")
+        try:
+            releases = _fetch_releases_json(
+                args.bucket,
+                args.region,
+                secret_id,
+                secret_key,
+                strict=True,
+            )
+        except (RuntimeError, json.JSONDecodeError) as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            sys.exit(1)
+        print(_latest_published_version(releases, args.market))
+        return
+
+    if not args.file or not args.data_manifest:
+        parser.error("--file and --data-manifest are required for upload")
+
     file_path = Path(args.file)
     if not file_path.exists():
         print(f"ERROR: file not found: {args.file}")
@@ -328,13 +433,20 @@ def main():
         sys.exit(1)
     data_manifest = json.loads(manifest_path.read_text())
 
-    market = data_manifest.get("market", "")
-    version = data_manifest.get("version", "")
-    if not market or not version:
+    tag, release_metadata = _release_metadata(data_manifest)
+    if release_metadata["release_type"] == "delta":
+        if not all(
+            (
+                release_metadata["market"],
+                release_metadata["base_version"],
+                release_metadata["target_version"],
+            )
+        ):
+            print("ERROR: delta manifest missing market, from_version, or to_version field")
+            sys.exit(1)
+    elif not release_metadata["market"] or not release_metadata["target_version"]:
         print("ERROR: manifest missing market or version field")
         sys.exit(1)
-
-    tag = f"data-{market.lower()}-{version}"
 
     key_prefix = args.key_prefix.strip("/")
     cos_key = f"{key_prefix}/{file_path.name}" if key_prefix else file_path.name
@@ -344,22 +456,24 @@ def main():
     print(f"  File: {file_path.name}")
 
     # 1. Upload archive
-    if not upload_file(
-        args.bucket, args.region, cos_key, file_path, secret_id, secret_key
-    ):
-        sys.exit(1)
+    if not args.index_only:
+        if not upload_file(
+            args.bucket, args.region, cos_key, file_path, secret_id, secret_key
+        ):
+            sys.exit(1)
 
     # 2. Update releases index
-    file_size = file_path.stat().st_size
-    entry = _build_release_entry(
-        data_manifest, file_path, file_size,
-        tag, args.bucket, args.region, cos_key,
-    )
-    if not _update_releases_index(
-        args.bucket, args.region, secret_id, secret_key,
-        tag, entry, args.max_releases,
-    ):
-        sys.exit(1)
+    if not args.skip_index:
+        file_size = file_path.stat().st_size
+        entry = _build_release_entry(
+            data_manifest, file_path, file_size,
+            tag, args.bucket, args.region, cos_key,
+        )
+        if not _update_releases_index(
+            args.bucket, args.region, secret_id, secret_key,
+            tag, entry, args.max_releases,
+        ):
+            sys.exit(1)
 
     print("Done.")
 

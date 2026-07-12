@@ -168,9 +168,30 @@ poetry run python scripts/export_parquet.py
 
 # US-Aktien exportieren → data/export/us/
 poetry run python scripts/export_parquet.py --market us
+
+# Benutzerdefiniertes Ausgabeverzeichnis
+poetry run python scripts/export_parquet.py --market cn --output /custom/path
 ```
 
-#### 4. In SimTradeLab verwenden
+Der normale Export erstellt das Zielverzeichnis vollständig aus DuckDB neu; er führt die vorhandenen Parquet-Dateien nicht direkt zusammen.
+
+#### 4. Daten veröffentlichen (Maintainer)
+
+Beide Vertriebskanäle verwenden denselben DuckDB-/Parquet-Snapshot, veröffentlichen aber unterschiedliche Artefakte:
+
+- **GitHub Releases** veröffentlicht ausschließlich vollständige Baseline-Archive.
+- **Tencent COS** veröffentlicht eine vollständige Baseline und, wenn die vorherige COS-Version sicher fortgeschrieben werden kann, zusätzlich ein inkrementelles Archiv. Der Index `releases.json` macht beide für Clients auffindbar.
+
+```bash
+# A-Aktiendaten auf GitHub veröffentlichen
+bash scripts/release_data.sh --market cn
+
+# Baseline und, wenn möglich, ein Delta auf Tencent COS veröffentlichen
+COS_SECRET_ID=... COS_SECRET_KEY=... bash scripts/release_data.sh \
+  --market cn --publish-targets cos --cos-bucket BUCKET --cos-region REGION 2026-06-22
+```
+
+#### 5. In SimTradeLab verwenden
 
 ```bash
 rsync -a data/export/cn/ /path/to/SimTradeLab/data/cn/
@@ -211,6 +232,23 @@ Enthält 23 Finanzkennzahlen und deren TTM-Versionen. Details siehe [PTRADE_PARQ
 | Finanzdaten | Ja (pro Aktie) | Ja (Massen-ZIP) | Nein | Nein | Ja (pro Aktie) |
 | Geldfluss | Nein | Nein | Ja (exklusiv) | Nein | Nein |
 | API-Schlüssel | Nicht erforderlich | Nicht erforderlich | Nicht erforderlich | N/A | Nicht erforderlich |
+
+## Inkrementeller Aktualisierungsablauf
+
+```bash
+# 1. Nur neue Daten herunterladen; vorhandene Daten werden übersprungen
+poetry run python scripts/download.py --tdx-download --skip-mootdx-ohlcv
+
+# 2. Vollständigen Parquet-Snapshot exportieren (ersetzt das Ausgabeverzeichnis)
+poetry run python scripts/export_parquet.py
+
+# 3. Nur für Maintainer: eigenständiges Delta-Paket exportieren
+poetry run python scripts/export_parquet.py --delta --base-version 2026-06-20 --target-version 2026-06-22
+```
+
+Der Delta-Export erzeugt ein separates Paket mit den geänderten Zeilen der Symboltabellen und einem Manifest für das angegebene Versionsfenster.
+
+Endnutzer führen diesen Delta-Befehl nicht aus und wählen keinen Aktualisierungsmodus. SimTradeDeskX fordert bei SimTradeAPI eine automatische Aktualisierung an: Zuerst wird ein konfigurierter dynamischer Delta-Endpunkt verwendet, danach eine statische COS-Delta-Kette. Bei der Erstinstallation, einer unvollständigen Delta-Kette oder einem fehlgeschlagenen Delta wird automatisch auf eine vollständige Baseline zurückgegriffen. Die API wendet die gesamte Delta-Kette zunächst auf einen Snapshot an und veröffentlicht ihn anschließend durch atomaren Verzeichnistausch. Bei einem Fehler bleiben die bisherigen nutzbaren Daten erhalten. GitHub Releases dienen als vollständiger Baseline-Fallback; COS unterstützt die indexierte inkrementelle Verteilung.
 
 ## Tests
 
