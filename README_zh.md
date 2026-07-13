@@ -247,12 +247,11 @@ bash scripts/release_data.sh --market cn
 # 发布美股数据
 bash scripts/release_data.sh --market us
 
-# 指定版本号
-bash scripts/release_data.sh --market cn 1.3.0
+# 发布版本来自 data/export/<market>/manifest.json
 
 # 发布完整基线，并在可用时同时发布 COS 增量包
 COS_SECRET_ID=... COS_SECRET_KEY=... bash scripts/release_data.sh \
-  --market cn --publish-targets cos --cos-bucket BUCKET --cos-region REGION 2026-06-22
+  --market cn --publish-targets cos --cos-bucket BUCKET --cos-region REGION
 ```
 
 #### 5. 在 SimTradeLab 中使用

@@ -448,6 +448,33 @@ def main():
         print("ERROR: manifest missing market or version field")
         sys.exit(1)
 
+    versions = (
+        (
+            ("delta manifest from_version", release_metadata["base_version"]),
+            ("delta manifest to_version", release_metadata["target_version"]),
+        )
+        if release_metadata["release_type"] == "delta"
+        else (("baseline manifest version", release_metadata["target_version"]),)
+    )
+    parsed_versions = {}
+    for label, version in versions:
+        try:
+            parsed = dt.date.fromisoformat(version)
+        except (TypeError, ValueError):
+            print(f"ERROR: {label} must be an ISO date (YYYY-MM-DD)")
+            sys.exit(1)
+        if parsed.isoformat() != version:
+            print(f"ERROR: {label} must be an exact ISO date (YYYY-MM-DD)")
+            sys.exit(1)
+        parsed_versions[label] = parsed
+
+    if release_metadata["release_type"] == "delta" and (
+        parsed_versions["delta manifest from_version"]
+        >= parsed_versions["delta manifest to_version"]
+    ):
+        print("ERROR: delta manifest from_version must be earlier than to_version")
+        sys.exit(1)
+
     key_prefix = args.key_prefix.strip("/")
     cos_key = f"{key_prefix}/{file_path.name}" if key_prefix else file_path.name
 

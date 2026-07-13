@@ -247,12 +247,11 @@ bash scripts/release_data.sh --market cn
 # Release US stock data
 bash scripts/release_data.sh --market us
 
-# Specify version
-bash scripts/release_data.sh --market cn 1.3.0
+# The release version comes from data/export/<market>/manifest.json
 
 # Publish a baseline and, when possible, a delta to Tencent COS
 COS_SECRET_ID=... COS_SECRET_KEY=... bash scripts/release_data.sh \
-  --market cn --publish-targets cos --cos-bucket BUCKET --cos-region REGION 2026-06-22
+  --market cn --publish-targets cos --cos-bucket BUCKET --cos-region REGION
 ```
 
 #### 5. Use in SimTradeLab

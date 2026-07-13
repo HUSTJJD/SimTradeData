@@ -74,11 +74,33 @@ try:
     local = d.date.fromisoformat(sys.argv[2])
 except (IndexError, ValueError):
     raise SystemExit(2)
+if remote.isoformat() != sys.argv[1] or local.isoformat() != sys.argv[2]:
+    raise SystemExit(2)
 raise SystemExit(0 if remote < local else 1 if remote == local else 3)' "$1" "$2" 2>/dev/null
+}
+
+is_exact_iso_date() {
+  run_cos_python -c 'import datetime as d, sys
+value = sys.argv[1]
+try:
+    parsed = d.date.fromisoformat(value)
+except (IndexError, ValueError):
+    raise SystemExit(2)
+raise SystemExit(0 if parsed.isoformat() == value else 2)' "$1" 2>/dev/null
 }
 
 delta_is_publishable() {
   run_cos_python -c 'import json, sys; manifest=json.load(sys.stdin); raise SystemExit(0 if not manifest.get("up_to_date") and not manifest.get("fallback_to_baseline") and not manifest.get("pipeline_busy") and manifest.get("tables") else 2)'
+}
+
+delta_versions_are_valid() {
+  run_cos_python -c 'import datetime as d, json, sys
+manifest = json.load(sys.stdin)
+base_value = manifest["from_version"]
+target_value = manifest["to_version"]
+base = d.date.fromisoformat(base_value)
+target = d.date.fromisoformat(target_value)
+raise SystemExit(0 if base.isoformat() == base_value and target.isoformat() == target_value and base < target else 2)'
 }
 
 # ── Publish single market ───────────────────────────────────────────
@@ -115,6 +137,10 @@ release_market() {
 
   local version
   version=$(run_cos_python -c "import json; print(json.load(open('$data_manifest'))['version'])")
+  if ! is_exact_iso_date "$version"; then
+    echo "ERROR: local manifest version is not an ISO date (YYYY-MM-DD): $version"
+    return 1
+  fi
   local tag="data-${market}-${version}"
   local archive_name="${tag}.tar.gz"
   local archive_dir
@@ -195,21 +221,27 @@ release_market() {
             echo "  Building COS delta from $cos_base_version to $version..."
             if poetry run python scripts/api_export_delta.py --market "$market" --last-sync "$cos_base_version" --output "$delta_archive"; then
               if tar -xOf "$delta_archive" manifest.json > "$delta_manifest"; then
-                local delta_manifest_status=0
-                delta_is_publishable < "$delta_manifest" || delta_manifest_status=$?
-                if [[ "$delta_manifest_status" -eq 0 ]]; then
-                  run_cos_upload \
-                    --skip-index \
-                    --file "$delta_archive" \
-                    --data-manifest "$delta_manifest" \
-                    --bucket "$COS_BUCKET" \
-                    --region "$COS_REGION" \
-                    --key-prefix "$COS_KEY_PREFIX" && delta_uploaded=true || cos_ok=false
-                elif [[ "$delta_manifest_status" -eq 2 ]]; then
-                  echo "  Delta unavailable; continuing with baseline upload"
+                if delta_versions_are_valid < "$delta_manifest" 2>/dev/null; then
+                  local delta_manifest_status=0
+                  delta_is_publishable < "$delta_manifest" || delta_manifest_status=$?
+                  if [[ "$delta_manifest_status" -eq 0 ]]; then
+                    run_cos_upload \
+                      --skip-index \
+                      --file "$delta_archive" \
+                      --data-manifest "$delta_manifest" \
+                      --bucket "$COS_BUCKET" \
+                      --region "$COS_REGION" \
+                      --key-prefix "$COS_KEY_PREFIX" && delta_uploaded=true || cos_ok=false
+                  elif [[ "$delta_manifest_status" -eq 2 ]]; then
+                    echo "  Delta unavailable; continuing with baseline upload"
+                  else
+                    echo "  ERROR: invalid delta manifest"
+                    cos_ok=false
+                  fi
                 else
-                  echo "  ERROR: invalid delta manifest"
+                  echo "  ERROR: delta manifest versions are not ISO dates (YYYY-MM-DD)"
                   cos_ok=false
+                  cos_mutation_allowed=false
                 fi
               else
                 echo "  ERROR: failed to read delta manifest"

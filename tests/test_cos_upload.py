@@ -274,6 +274,107 @@ def test_delta_manifest_uses_version_range_for_tag_and_release_metadata(
     )
 
 
+@pytest.mark.parametrize(
+    ("manifest_data", "expected_error"),
+    [
+        (
+            {"market": "cn", "version": "1.3.0"},
+            "baseline manifest version must be an ISO date",
+        ),
+        (
+            {"market": "cn", "version": "20260710"},
+            "baseline manifest version must be an exact ISO date",
+        ),
+        (
+            {"market": "cn", "version": "2026-W28-5"},
+            "baseline manifest version must be an exact ISO date",
+        ),
+        (
+            {
+                "package_format": "simtradedata_api_delta_v1",
+                "market": "cn",
+                "from_version": "invalid-date",
+                "to_version": "2026-07-10",
+            },
+            "delta manifest from_version must be an ISO date",
+        ),
+        (
+            {
+                "package_format": "simtradedata_api_delta_v1",
+                "market": "cn",
+                "from_version": "2026-07-09",
+                "to_version": "2026-02-30",
+            },
+            "delta manifest to_version must be an ISO date",
+        ),
+        (
+            {
+                "package_format": "simtradedata_api_delta_v1",
+                "market": "cn",
+                "from_version": "2026-07-10",
+                "to_version": "2026-07-10",
+            },
+            "delta manifest from_version must be earlier than to_version",
+        ),
+        (
+            {
+                "package_format": "simtradedata_api_delta_v1",
+                "market": "cn",
+                "from_version": "2026-07-11",
+                "to_version": "2026-07-10",
+            },
+            "delta manifest from_version must be earlier than to_version",
+        ),
+    ],
+)
+def test_invalid_manifest_versions_block_archive_and_index_mutations(
+    monkeypatch, tmp_path, capsys, manifest_data, expected_error
+):
+    cos_upload = _load_cos_upload()
+    archive = tmp_path / "data.tar.gz"
+    archive.write_bytes(b"archive")
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps(manifest_data))
+    uploads = []
+    indexes = []
+
+    monkeypatch.setenv("COS_SECRET_ID", "sid")
+    monkeypatch.setenv("COS_SECRET_KEY", "skey")
+    monkeypatch.setattr(
+        cos_upload,
+        "upload_file",
+        lambda *args: uploads.append(args) or True,
+    )
+    monkeypatch.setattr(
+        cos_upload,
+        "_update_releases_index",
+        lambda *args: indexes.append(args) or True,
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cos_upload.py",
+            "--file",
+            str(archive),
+            "--data-manifest",
+            str(manifest),
+            "--bucket",
+            "bucket",
+            "--region",
+            "region",
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        cos_upload.main()
+
+    assert exc_info.value.code == 1
+    assert uploads == []
+    assert indexes == []
+    assert expected_error in capsys.readouterr().out
+
+
 def test_latest_published_version_supports_new_and_legacy_entries():
     cos_upload = _load_cos_upload()
     releases = [
@@ -487,6 +588,7 @@ def _run_release_script(
     *,
     base_version: str,
     delta_mode: str,
+    local_version: str = "2026-07-10",
     baseline_mode: str = "success",
     lookup_mode: str = "success",
     delta_index_mode: str = "success",
@@ -563,7 +665,7 @@ print("|".join((tag, "delta" if delta else "baseline", m.get("from_version", "")
             if [[ "$1" == "--market" ]]; then market="$2"; shift 2; else shift; fi
           done
           mkdir -p "$PWD/data/export/$market"
-          printf '{"market":"%s","version":"2026-07-10"}\n' "$market" > "$PWD/data/export/$market/manifest.json"
+          printf '{"market":"%s","version":"%s"}\n' "$market" "$LOCAL_VERSION" > "$PWD/data/export/$market/manifest.json"
           exit 0
         fi
         if [[ "$script" == "scripts/api_export_delta.py" ]]; then
@@ -575,6 +677,12 @@ print("|".join((tag, "delta" if delta else "baseline", m.get("from_version", "")
           mkdir -p "$package"
           if [[ "$DELTA_MODE" == "success" ]]; then
             printf '%s\n' '{"package_format":"simtradedata_api_delta_v1","market":"cn","from_version":"2026-07-09","to_version":"2026-07-10","up_to_date":false,"fallback_to_baseline":false,"pipeline_busy":false,"tables":[{"table":"stocks"}]}' > "$package/manifest.json"
+          elif [[ "$DELTA_MODE" == "invalid-date" ]]; then
+            printf '%s\n' '{"package_format":"simtradedata_api_delta_v1","market":"cn","from_version":"invalid-date","to_version":"2026-07-10","up_to_date":false,"fallback_to_baseline":false,"pipeline_busy":false,"tables":[{"table":"stocks"}]}' > "$package/manifest.json"
+          elif [[ "$DELTA_MODE" == "equal-date" ]]; then
+            printf '%s\n' '{"package_format":"simtradedata_api_delta_v1","market":"cn","from_version":"2026-07-10","to_version":"2026-07-10","up_to_date":false,"fallback_to_baseline":false,"pipeline_busy":false,"tables":[{"table":"stocks"}]}' > "$package/manifest.json"
+          elif [[ "$DELTA_MODE" == "reversed-date" ]]; then
+            printf '%s\n' '{"package_format":"simtradedata_api_delta_v1","market":"cn","from_version":"2026-07-11","to_version":"2026-07-10","up_to_date":false,"fallback_to_baseline":false,"pipeline_busy":false,"tables":[{"table":"stocks"}]}' > "$package/manifest.json"
           elif [[ "$DELTA_MODE" == "fallback" ]]; then
             printf '%s\n' '{"market":"cn","from_version":"2026-07-09","to_version":"2026-07-10","up_to_date":false,"fallback_to_baseline":true,"pipeline_busy":false,"tables":[]}' > "$package/manifest.json"
           else
@@ -613,6 +721,7 @@ print("|".join((tag, "delta" if delta else "baseline", m.get("from_version", "")
         "COS_SECRET_ID": "sid",
         "COS_SECRET_KEY": "skey",
         "FAKE_BASE_VERSION": base_version,
+        "LOCAL_VERSION": local_version,
         "DELTA_MODE": delta_mode,
         "BASELINE_MODE": baseline_mode,
         "LOOKUP_MODE": lookup_mode,
@@ -685,6 +794,59 @@ def test_release_script_date_error_fails_cos_publish_but_uploads_baseline(tmp_pa
     assert result.returncode != 0
     assert uploads == []
     assert "date comparison failed" in result.stdout
+    assert not archive_dir.exists()
+
+
+def test_release_script_invalid_local_version_on_empty_bucket_blocks_all_cos_mutation(
+    tmp_path,
+):
+    result, uploads, _, archive_dir = _run_release_script(
+        tmp_path,
+        base_version="",
+        local_version="invalid-date",
+        delta_mode="success",
+    )
+
+    assert result.returncode != 0
+    assert uploads == []
+    assert "local manifest version is not an ISO date" in result.stdout
+    assert not archive_dir.exists()
+
+
+def test_release_script_invalid_delta_version_blocks_all_cos_mutation(tmp_path):
+    result, uploads, _, archive_dir = _run_release_script(
+        tmp_path,
+        base_version="2026-07-09",
+        delta_mode="invalid-date",
+    )
+
+    assert result.returncode != 0
+    assert uploads == []
+    assert "delta manifest versions are not ISO dates" in result.stdout
+    assert not archive_dir.exists()
+
+
+@pytest.mark.parametrize(
+    ("base_version", "local_version", "delta_mode"),
+    [
+        ("", "20260710", "success"),
+        ("", "2026-W28-5", "success"),
+        ("2026-07-09", "2026-07-10", "equal-date"),
+        ("2026-07-09", "2026-07-10", "reversed-date"),
+    ],
+)
+def test_release_script_rejects_noncanonical_or_nonincreasing_versions_before_cos_mutation(
+    tmp_path, base_version, local_version, delta_mode
+):
+    result, uploads, _, archive_dir = _run_release_script(
+        tmp_path,
+        base_version=base_version,
+        local_version=local_version,
+        delta_mode=delta_mode,
+    )
+
+    assert result.returncode != 0
+    assert uploads == []
     assert not archive_dir.exists()
 
 

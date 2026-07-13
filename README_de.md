@@ -186,9 +186,11 @@ Beide Vertriebskanäle verwenden denselben DuckDB-/Parquet-Snapshot, veröffentl
 # A-Aktiendaten auf GitHub veröffentlichen
 bash scripts/release_data.sh --market cn
 
+# Die Release-Version stammt aus data/export/<market>/manifest.json
+
 # Baseline und, wenn möglich, ein Delta auf Tencent COS veröffentlichen
 COS_SECRET_ID=... COS_SECRET_KEY=... bash scripts/release_data.sh \
-  --market cn --publish-targets cos --cos-bucket BUCKET --cos-region REGION 2026-06-22
+  --market cn --publish-targets cos --cos-bucket BUCKET --cos-region REGION
 ```
 
 #### 5. In SimTradeLab verwenden
