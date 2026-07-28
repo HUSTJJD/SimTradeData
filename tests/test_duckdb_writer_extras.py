@@ -115,6 +115,9 @@ class TestExpandedFundamentals:
         exported = pq.read_table(
             tmp_path / "fundamentals" / "000001.SZ.parquet"
         ).to_pandas()
+        manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
+        assert manifest["package_format"] == "simtrade-data-market-v1"
+        assert manifest["mode"] == "full"
         assert "total_assets" in exported.columns
         assert "operating_revenue" in exported.columns
         assert "net_operate_cash_flow" in exported.columns

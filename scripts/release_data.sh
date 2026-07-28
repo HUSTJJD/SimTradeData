@@ -147,12 +147,20 @@ release_market() {
   archive_dir=$(mktemp -d "/tmp/${tag}.XXXXXX")
   trap 'rm -rf "$archive_dir"' RETURN EXIT
   local archive="$archive_dir/$archive_name"
+  local checksum="$archive_dir/${tag}.sha256"
   local local_archive="$LOCAL_RELEASE_DIR/$archive_name"
 
   # 2. Package
   echo ""
   echo "=== Packaging ${market} ${version} ==="
   tar -czf "$archive" -C "$export_dir" .
+  run_cos_python -c 'import hashlib, pathlib, sys
+path = pathlib.Path(sys.argv[1])
+digest = hashlib.sha256()
+with path.open("rb") as source:
+    for chunk in iter(lambda: source.read(1024 * 1024), b""):
+        digest.update(chunk)
+print(f"{digest.hexdigest()}  {sys.argv[2]}")' "$archive" "$archive_name" > "$checksum"
 
   local size
   size=$(du -h "$archive" | cut -f1)
@@ -181,12 +189,12 @@ release_market() {
     echo "=== Publishing to GitHub ==="
     if gh release view "$tag" >/dev/null 2>&1; then
       echo "  Release $tag exists, updating..."
-      gh release upload "$tag" "$archive" --clobber || github_ok=false
+      gh release upload "$tag" "$archive" "$checksum" --clobber || github_ok=false
     else
       gh release create "$tag" \
         --title "SimTradeData ${market} ${version}" \
         --notes "Data date: ${version} (${market})" \
-        "$archive" || github_ok=false
+        "$archive" "$checksum" || github_ok=false
     fi
     if $github_ok; then
       echo "  -> $(gh release view "$tag" --json url -q .url 2>/dev/null || echo "uploaded")"

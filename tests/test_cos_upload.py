@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -214,6 +215,9 @@ def test_baseline_manifest_preserves_tag_and_asset_and_adds_release_metadata(
     assert releases[0]["entry"]["market"] == "CN"
     assert releases[0]["entry"]["target_version"] == "2026-06-26"
     assert releases[0]["entry"]["assets"][0]["name"] == archive.name
+    assert releases[0]["entry"]["assets"][0]["sha256"] == hashlib.sha256(
+        archive.read_bytes()
+    ).hexdigest()
     assert releases[0]["entry"]["assets"][0]["browser_download_url"].endswith(
         f"/{archive.name}"
     )
@@ -564,7 +568,10 @@ def test_release_data_publishes_cos_delta_before_baseline():
     assert "pipeline_busy" in source
     assert 'manifest.get("tables")' in source
     assert source.index(delta_upload) < source.index(baseline_upload)
-    assert "gh release upload" in source
+    assert 'local checksum="$archive_dir/${tag}.sha256"' in source
+    assert "digest = hashlib.sha256()" in source
+    assert 'gh release upload "$tag" "$archive" "$checksum" --clobber' in source
+    assert '"$archive" "$checksum" || github_ok=false' in source
 
 
 def _write_executable(path: Path, source: str) -> None:

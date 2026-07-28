@@ -153,6 +153,14 @@ def upload_file(
     return False
 
 
+def _sha256_file(file_path: Path) -> str:
+    digest = hashlib.sha256()
+    with file_path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _upload_file_with_sdk(
     bucket: str,
     region: str,
@@ -292,6 +300,7 @@ def _build_release_entry(
 ) -> dict:
     """Build a GitHub-API-compatible release entry from data manifest + archive."""
     archive_name = archive_path.name
+    archive_sha256 = _sha256_file(archive_path)
 
     # Brief release body
     market = data_manifest.get("market", "")
@@ -314,6 +323,7 @@ def _build_release_entry(
             {
                 "name": archive_name,
                 "size": archive_size,
+                "sha256": archive_sha256,
                 "browser_download_url": (
                     f"https://{_cos_host(bucket, region)}/{cos_key}"
                 ),
