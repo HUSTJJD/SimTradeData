@@ -233,7 +233,12 @@ poetry run python scripts/export_parquet.py --market us
 poetry run python scripts/export_parquet.py --market cn --output /custom/path
 ```
 
-#### 4. Release to GitHub (Maintainer)
+#### 4. Publish Data (Maintainer)
+
+The same DuckDB snapshot is exported to Parquet for both distribution channels, but the published artifacts differ:
+
+- **GitHub Releases** publishes full baseline archives only.
+- **Tencent COS** publishes a full baseline plus an incremental archive when the previous COS version can be advanced safely. Its `releases.json` index lets clients discover both.
 
 ```bash
 # Release A-shares data
@@ -242,8 +247,11 @@ bash scripts/release_data.sh --market cn
 # Release US stock data
 bash scripts/release_data.sh --market us
 
-# Specify version
-bash scripts/release_data.sh --market cn 1.3.0
+# The release version comes from data/export/<market>/manifest.json
+
+# Publish a baseline and, when possible, a delta to Tencent COS
+COS_SECRET_ID=... COS_SECRET_KEY=... bash scripts/release_data.sh \
+  --market cn --publish-targets cos --cos-bucket BUCKET --cos-region REGION
 ```
 
 #### 5. Use in SimTradeLab
@@ -417,16 +425,18 @@ BATCH_SIZE = 20
 # 1. Incremental download (fetches only new data, automatically skips existing)
 poetry run python scripts/download.py --tdx-download --skip-mootdx-ohlcv
 
-# 2. Export to Parquet
+# 2. Export a full Parquet snapshot (replaces the output directory)
 poetry run python scripts/export_parquet.py              # CN → data/export/cn/
 poetry run python scripts/export_parquet.py --market us  # US → data/export/us/
 
-# 3. Optional: export a client delta package for downstream local merge/rebuild
+# 3. Maintainers only: export a standalone delta package
 poetry run python scripts/export_parquet.py --delta --base-version 2026-06-20 --target-version 2026-06-22
 ```
 
 Step 1 imports the latest TDX daily package, skips Mootdx OHLCV after that fast path, and refreshes the remaining Mootdx/BaoStock datasets. When there are no new trading days, existing rows are skipped quickly.
-Delta export contains changed symbol-table rows and a manifest for the requested version window. First install, periodic reconciliation, and failed delta recovery still use the full Parquet export.
+The normal export in step 2 rebuilds the destination from DuckDB; it is not an in-place Parquet merge. Delta export writes a separate package containing changed symbol-table rows and a manifest for the requested version window.
+
+End users do not run the delta command or choose an update mode. SimTradeDeskX asks SimTradeAPI for an automatic update: the API prefers a configured dynamic delta endpoint, then a COS delta chain, and falls back to a full baseline for first install, reconciliation, or failed delta recovery. It applies the complete chain to a snapshot and publishes it with an atomic directory swap, so a failed update keeps the previous data intact. GitHub Releases remain the full-baseline fallback; COS is the channel that supports indexed incremental delivery.
 
 For production scheduling, run the daily script later in the trading day (for example after 22:30). It uses the same TDX-backed fast path by default. The recommended production setting is three bounded attempts, each covering download plus pre-release integrity, so transient upstream delays can recover without publishing incomplete data:
 

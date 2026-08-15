@@ -3062,6 +3062,8 @@ class DuckDBWriter:
         stock_count = result[2] or 0
 
         manifest = {
+            "package_format": "simtrade-data-market-v1",
+            "mode": "full",
             "version": end_date,
             "market": market.upper(),
             "date_range": {

@@ -44,6 +44,21 @@ INTEGRITY_STRICT=1
 For COS publishing, use `PUBLISH_TARGETS=cos` and provide the bucket, region,
 key prefix, and credentials.
 
+GitHub Releases and COS use the same exported Parquet snapshot but have different
+distribution roles:
+
+- GitHub publishes full baseline archives only.
+- COS publishes the baseline and, when the existing COS version can be advanced,
+  a delta archive indexed by `releases.json`.
+
+The COS release is deliberately fail-closed. Before any upload, the publisher
+must read and validate the existing index, reject malformed JSON or invalid
+dates, and stop if the remote version is newer than the local version. A valid
+delta is uploaded without indexing it first; the baseline archive and its index
+entry are then published; only after that succeeds is the delta entry added to
+`releases.json`. This ordering prevents clients from discovering a delta whose
+target baseline was not published successfully.
+
 ## Status Check
 
 From the repository root:
@@ -104,3 +119,9 @@ poetry run python scripts/check_integrity.py --market cn --strict --json-output 
   attempts fail, wait for the next schedule or run a bounded manual repair.
 - Bad published data: move manifest/latest pointer back to the previous version
   and keep logs for diagnosis.
+- COS index lookup or validation failure: do not upload or rewrite release
+  metadata. Fix the remote index or version mismatch first, then rerun the
+  bounded publish job.
+- Partial COS publish: an unindexed delta archive is safe to leave in object
+  storage; clients cannot discover it. Do not add its index entry until the
+  corresponding baseline publication has succeeded.

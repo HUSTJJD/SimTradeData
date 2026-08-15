@@ -233,7 +233,12 @@ poetry run python scripts/export_parquet.py --market us
 poetry run python scripts/export_parquet.py --market cn --output /custom/path
 ```
 
-#### 4. 发布到 GitHub（维护者）
+#### 4. 发布数据（维护者）
+
+两个分发渠道都来自同一份 DuckDB/Parquet 快照，但发布内容不同：
+
+- **GitHub Releases** 只发布完整基线包。
+- **腾讯云 COS** 发布完整基线；当 COS 上一版本可以安全推进时，同时发布增量包，并通过 `releases.json` 索引供客户端发现。
 
 ```bash
 # 发布 A股数据
@@ -242,8 +247,11 @@ bash scripts/release_data.sh --market cn
 # 发布美股数据
 bash scripts/release_data.sh --market us
 
-# 指定版本号
-bash scripts/release_data.sh --market cn 1.3.0
+# 发布版本来自 data/export/<market>/manifest.json
+
+# 发布完整基线，并在可用时同时发布 COS 增量包
+COS_SECRET_ID=... COS_SECRET_KEY=... bash scripts/release_data.sh \
+  --market cn --publish-targets cos --cos-bucket BUCKET --cos-region REGION
 ```
 
 #### 5. 在 SimTradeLab 中使用
@@ -412,16 +420,18 @@ BATCH_SIZE = 20
 # 1. 增量下载（仅获取新数据，已有数据自动跳过）
 poetry run python scripts/download.py --tdx-download --skip-mootdx-ohlcv
 
-# 2. 导出为 Parquet（覆盖旧的导出）
+# 2. 导出完整 Parquet 快照（替换输出目录）
 poetry run python scripts/export_parquet.py
 
-# 3. 可选：导出客户端增量包（供下游应用本地合并重建）
+# 3. 仅维护者：导出独立增量包
 poetry run python scripts/export_parquet.py --delta --base-version 2026-06-20 --target-version 2026-06-22
 ```
 
 第 1 步会导入最新 TDX 日线包，然后跳过 Mootdx OHLCV，并刷新剩余 Mootdx/BaoStock 数据。
 无新交易日时已有行会快速跳过。
-delta 导出只包含指定版本窗口内变化的 symbol 表行和 manifest；首次安装、校准和失败回退仍使用完整 Parquet 导出。
+第 2 步的普通导出会从 DuckDB 重建目标目录，并不是在原 Parquet 文件上原地合并。delta 导出会生成独立数据包，只包含指定版本窗口内变化的 symbol 表行和 manifest。
+
+终端用户不需要运行 delta 命令，也不需要选择更新模式。SimTradeDeskX 会让 SimTradeAPI 自动更新：优先使用已配置的动态增量端点，其次使用 COS 的增量链；首次安装、校准或增量失败时自动回退到完整基线。API 会先在快照上应用整条增量链，再通过目录原子替换发布，因此更新失败时旧数据仍然可用。GitHub Releases 保持为完整基线回退渠道；COS 才提供带索引的增量分发。
 
 生产环境建议使用每日脚本，并把执行时间放到交易日较晚时段（例如 22:30 以后）。该脚本默认使用同一条 TDX 快路径。推荐生产配置是三次有界尝试，每次都覆盖下载和发布前完整性门禁，让短暂的数据源延迟有机会自动恢复，但仍不会发布不完整数据：
 
