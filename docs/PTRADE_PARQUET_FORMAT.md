@@ -259,25 +259,6 @@ b[i] = a[i+1] * (-bonus_ps + rationed_ps * rationed_px) / m + b[i+1]
 
 ---
 
-### 10.1 metadata/index_history.parquet - 长历史指数行情
-
-由 `scripts/build_index_history.py --apply` 从权威库 `stocks` 表中的指数
-伪代码幂等生成；这是**附加资产**，不改变 `benchmark` 表 / `benchmark.parquet`
-的默认指数（沪深 300，诞生于 2005-01-04），也不为指数补造诞生前的行情。
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `date` | date | 交易日 |
-| `symbol` | string | `000300.SS`、`000016.SS`、`000905.SS`、`000001.SS`、`399001.SZ`、`399006.SZ` |
-| `open` / `high` / `low` / `close` | double | 指数点位 |
-| `volume` / `money` | double | 成交量 / 成交额 |
-
-最早记录为上证综指 `000001.SS` 的 `1990-12-19`、深证成指 `399001.SZ` 的
-`1991-04-03`；各指数起点见 `BENCHMARK_INDEX_INCEPTION`。发布流程更新日线后
-应重跑该脚本，否则该资产会停留在上一次构建的日期。
-
----
-
 ### 11. ptrade_adj_pre.parquet / ptrade_adj_post.parquet - 复权因子
 
 | 字段 | 类型 | 说明 |

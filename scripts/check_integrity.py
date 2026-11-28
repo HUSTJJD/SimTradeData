@@ -64,7 +64,6 @@ _CN_HISTORY_FLOOR_TABLES = (
     ("valuation", False),
     ("fundamentals", False),
     ("benchmark", False),
-    ("index_history", False),
     ("trade_days", False),
     ("money_flow", False),
     ("lhb", False),

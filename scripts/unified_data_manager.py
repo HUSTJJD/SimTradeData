@@ -43,7 +43,6 @@ import json
 import logging
 import os
 import shutil
-import subprocess
 import sys
 from collections import Counter
 from datetime import date, datetime, timedelta
@@ -1229,31 +1228,6 @@ def promote_staged_export(stage: Path, apply: bool) -> dict[str, Any]:
     return result
 
 
-def _refresh_index_history() -> dict[str, Any]:
-    """Rebuild the additive 1990s index asset after a metadata/ promotion.
-
-    ``promote_staged_export`` replaces the whole metadata/ directory, so a
-    previously generated index_history.parquet would otherwise be lost. This
-    runs in a separate process after the writer's connection is closed and
-    never blocks the publish on failure (the asset is additive, not part of the
-    PTrade storage contract).
-    """
-    script = HERE / "build_index_history.py"
-    try:
-        proc = subprocess.run(
-            [sys.executable, str(script), "--apply"],
-            capture_output=True, text=True, errors="replace", timeout=300,
-        )
-    except Exception as exc:  # noqa: BLE001
-        return {"status": "skipped", "reason": str(exc)}
-    detail = (proc.stdout or proc.stderr).strip()
-    return {
-        "status": "pass" if proc.returncode == 0 else "fail",
-        "returncode": proc.returncode,
-        "detail": detail[:800],
-    }
-
-
 def prune_stale_artifacts(current_stage: Path | None = None) -> dict[str, Any]:
     """Remove derived leftovers: stale staging, historical backup dirs, swaps.
 
@@ -2128,7 +2102,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         report["promotion"] = promote_staged_export(stage, apply=True)
         shutil.rmtree(stage, ignore_errors=True)
         report["serving_placeholders"] = ensure_serving_placeholders(True, target, gate_symbols)
-        report["index_history"] = _refresh_index_history()
 
     report["integrity_after"] = _integrity_report(
         target, CN_DIR if CN_DIR.is_dir() else None, history_start

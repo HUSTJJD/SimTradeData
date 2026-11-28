@@ -48,7 +48,7 @@ tasks:
     may_contact_baostock: false
     may_publish: false
     publish_targets_allowed:
-    failure_policy: Report only. One 1m DAT per market is a known warning because true 1m bars were never downloaded in the QMT client; GitHub-hosted runners cannot see this local path, so this task is host-local only.
+    failure_policy: Report only. True 1m bars are not a supported offline-backtest channel and are deliberately not probed; GitHub-hosted runners cannot see this local path, so this task is host-local only.
 
   - id: daily_cn_data
     name: CN daily data refresh

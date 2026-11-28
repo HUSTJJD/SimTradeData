@@ -46,13 +46,14 @@ läuft über `unified_data_manager.py --apply --full-history --history-start
 1990-12-19`; der normale inkrementelle Lauf bleibt bei 24 Monaten und ergänzt
 keine 1990er Jahre.
 
-**Grenzen der 1990er Jahre**: Finanzdaten aus den 1990ern sind nur sehr dünn
-vorhanden, Bewertungen beginnen 1992, der Standard-Benchmark CSI 300 erst 2005,
-ETFs und Indexzusammensetzungen existierten damals noch nicht.
-`scripts/build_index_history.py --apply` veröffentlicht deshalb die bereits
-vorhandenen langen Indexreihen (Shanghai Composite ab 1990, SZSE Component ab
-1991) als zusätzliches Asset `metadata/index_history.parquet`, ohne den
-Standard-Benchmark zu ändern oder Kurse vor Indexgründung zu erfinden.
+**Grenzen der 1990er Jahre**: Die offiziellen PTrade-Kurs-APIs
+(`get_history` / `get_price`) liefern nur Daten ab 2005; `get_trade_days`
+erlaubt einen Kalenderstart ab 1990. Der lokale 1990er-Bestand ist eine
+Erweiterung des Offline-Pakets, keine offizielle Backtest-Fähigkeit.
+Finanzdaten aus den 1990ern sind nur sehr dünn vorhanden, ETFs und
+Indexzusammensetzungen existierten damals noch nicht. Zusätzliche
+Index-Historie-Assets oder Longhubang-Daten werden nicht unterstützt:
+PTrade bietet dafür keine Daten-API und SimTradeLab keinen Lesepfad.
 
 `unified_data_manager.py` prüft vor der Veröffentlichung die Datenqualität,
 gleicht optional lokale QMT-DAT-Dateien ab (0,5 %-Toleranz; systematische

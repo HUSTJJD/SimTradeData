@@ -33,9 +33,11 @@ TZ8 = timezone(timedelta(hours=8))
 MIN_TIME = 946684800  # 2000-01-01 UTC, same floor as qmt_kline.py
 RECORD_BYTES = {7001: 1264, 7002: 664, 7003: 920, 7004: 56,
                 7005: 64, 7006: 416, 7007: 416, 7008: 344}
-PERIOD_DIRS = {"daily": "86400", "5m": "300", "1m": "60"}
+# Only periods the offline backtest can actually consume are probed. True 1m
+# bars are not a supported data channel here (QMT never downloaded them), so
+# the 60/ directory is deliberately not monitored.
+PERIOD_DIRS = {"daily": "86400", "5m": "300"}
 SAMPLE_FILES = 20
-MIN_ONE_MINUTE_FILES = 100
 
 
 def _last_stamp(path: Path) -> str | None:
@@ -180,10 +182,6 @@ def build(qmt_root: Path) -> dict[str, Any]:
                 report["errors"].append(f"bad_record_size:{key}:{scanned['bad_record_size']}")
             if scanned["undecodable_samples"]:
                 report["errors"].append(f"undecodable_samples:{key}:{scanned['undecodable_samples']}")
-            if label == "1m" and scanned["files"] < MIN_ONE_MINUTE_FILES:
-                report["warnings"].append(
-                    f"insufficient_1m:{key}:{scanned['files']} files (true 1m bars were never downloaded in the QMT client)"
-                )
         report["finance"][market] = _scan_finance(datadir / "Finance" / market / "86400")
         if report["finance"][market]["undivisible"]:
             report["errors"].append(

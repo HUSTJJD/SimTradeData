@@ -66,7 +66,6 @@ DOMAINS = {
     "margin_trading": "margin_trading",
     "lhb": "lhb",
     "benchmark": "benchmark",
-    "index_history": "index_history",
     "trade_days": "trade_days",
     "stock_metadata": "stock_metadata",
 }
@@ -580,7 +579,7 @@ def build_report(db_path: Path, export_dir: Path, target_date: str | None = None
             "ptrade_domain_catalog": {
                 "covered_locally": [
                     "stocks", "etf_or_fund_like_metadata_and_bars_when_available", "daily OHLCV",
-                    "valuation", "fundamentals", "exrights", "benchmark", "index_history", "trade_days",
+                    "valuation", "fundamentals", "exrights", "benchmark", "trade_days",
                     "stock_metadata", "stock_status", "index_constituents", "minute_bars_serving_assets",
                 ],
                 "known_empty_tables": ["money_flow", "margin_trading", "lhb"],

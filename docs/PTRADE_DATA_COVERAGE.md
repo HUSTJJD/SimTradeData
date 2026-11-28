@@ -70,10 +70,7 @@
   需补充专门财务报表源，并按 PTrade 表和字段核验。
 - **真实账户数据**：资金、持仓、柜台订单、账户成交、券商融券库存与费率
   来自券商/PTrade 交易连接。模拟引擎产生的记录应标为模拟数据。
-- **龙虎榜与资金流口径**：`lhb` 表已用 QMT 本地席位明细离线灌入 229,171 行
-  （2006-09-01 → 2026-11-20），但它是席位买卖金额求和，报告中标注
-  `ptrade_semantics_verified: false`，不能等同东财/PTrade `BILLBOARD_*` 字段；
-  `money_flow`、`margin_trading` 仍无本机来源。详见 [缺口台账](PARITY_GAPS.md)。
+- **龙虎榜 / 主力资金流 / 两融余额 / L2 / 真 1m**：PTrade 官方回测 API 没有这些数据接口，SimTradeLab 也没有读取通道；按「官方不支持就不支持」的原则不再补齐或维护，`lhb` / `money_flow` / `margin_trading` 保持为空表（[patch_all_from_qmt.py](../scripts/patch_all_from_qmt.py) 早有同一裁决）。`docs/CLI_GUIDE.md` 里的联网补 DB 脚本只是数据源工具，不是回测数据通道。详见 [缺口台账](PARITY_GAPS.md)。
 
 ## 接近一比一需要单独验收的语义
 
